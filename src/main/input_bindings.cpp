@@ -276,7 +276,47 @@ Bindings default_bindings() {
     add(Target::StickUp,    pax(SDL_CONTROLLER_AXIS_LEFTY, -1));
     add(Target::StickDown,  pax(SDL_CONTROLLER_AXIS_LEFTY, +1));
 
+#ifdef __vita__
+    // The Vita has no analog triggers or guide button, so the Z and C-Right binds above could never be pressed.
+    apply_vita_pad_defaults(b);
+#endif
     return b;
+}
+
+bool same_source(const Source& a, const Source& b) {
+    return (a.kind == b.kind) && (a.code == b.code) && (a.dir == b.dir) && (a.dev == b.dev);
+}
+
+void apply_vita_pad_defaults(Bindings& b) {
+    for (auto& list : b.targets) {
+        list.erase(std::remove_if(list.begin(), list.end(), [](const Source& s) {
+            return (s.kind == SourceKind::PadButton) || (s.kind == SourceKind::PadAxis);
+        }), list.end());
+    }
+    b.chords.clear();
+    auto add = [&](Target t, Source s) { b.targets[(int)t].push_back(s); };
+    auto pb  = [](int c)  { return Source{ SourceKind::PadButton, c, 0 }; };
+    auto pax = [](int c, int d) { return Source{ SourceKind::PadAxis, c, (int8_t)d }; };
+    add(Target::A,         pb(SDL_CONTROLLER_BUTTON_A));
+    add(Target::B,         pb(SDL_CONTROLLER_BUTTON_X));
+    add(Target::CDown,     pb(SDL_CONTROLLER_BUTTON_B));
+    add(Target::CUp,       pb(SDL_CONTROLLER_BUTTON_Y));
+    add(Target::Z,         pb(SDL_CONTROLLER_BUTTON_BACK));
+    add(Target::LTrig,     pb(SDL_CONTROLLER_BUTTON_LEFTSHOULDER));
+    add(Target::RTrig,     pb(SDL_CONTROLLER_BUTTON_RIGHTSHOULDER));
+    add(Target::Start,     pb(SDL_CONTROLLER_BUTTON_START));
+    add(Target::DpadUp,    pb(SDL_CONTROLLER_BUTTON_DPAD_UP));
+    add(Target::DpadDown,  pb(SDL_CONTROLLER_BUTTON_DPAD_DOWN));
+    add(Target::DpadLeft,  pb(SDL_CONTROLLER_BUTTON_DPAD_LEFT));
+    add(Target::DpadRight, pb(SDL_CONTROLLER_BUTTON_DPAD_RIGHT));
+    add(Target::StickRight, pax(SDL_CONTROLLER_AXIS_LEFTX, +1));
+    add(Target::StickLeft,  pax(SDL_CONTROLLER_AXIS_LEFTX, -1));
+    add(Target::StickUp,    pax(SDL_CONTROLLER_AXIS_LEFTY, -1));
+    add(Target::StickDown,  pax(SDL_CONTROLLER_AXIS_LEFTY, +1));
+    add(Target::CUp,    pax(SDL_CONTROLLER_AXIS_RIGHTY, -1));
+    add(Target::CDown,  pax(SDL_CONTROLLER_AXIS_RIGHTY, +1));
+    add(Target::CLeft,  pax(SDL_CONTROLLER_AXIS_RIGHTX, -1));
+    add(Target::CRight, pax(SDL_CONTROLLER_AXIS_RIGHTX, +1));
 }
 
 bool resolve(const Bindings& b, const RawState& s, uint16_t* buttons, float* x, float* y) {
@@ -294,11 +334,27 @@ bool resolve(const Bindings& b, const RawState& s, uint16_t* buttons, float* x, 
     // Full gamepad/joystick deflection maps to the N64's ~80 rather than 127 (the host scales x by 127), so the throw isn't clipped.
     const float range = std::clamp(b.stick_range, 1.0f, 127.0f) / 127.0f;
 
+    // Chords whose inputs are all held press their target; those inputs then stop pressing their own targets.
     uint16_t btn = 0;
+    std::vector<const Source*> chorded;
+    for (const Chord& c : b.chords) {
+        if (c.sources.size() < 2) continue;
+        bool held = true;
+        for (const Source& src : c.sources) held = held && (source_value(src, st, b) > 0.5f);
+        if (!held) continue;
+        btn |= target_mask(c.target);
+        for (const Source& src : c.sources) chorded.push_back(&src);
+    }
+    auto is_chorded = [&](const Source& src) {
+        for (const Source* c : chorded) if (same_source(*c, src)) return true;
+        return false;
+    };
+
     float defl[(int)Target::Count] = {0};
     for (int t = 0; t < (int)Target::Count; ++t) {
         float dig = 0.0f, ana = 0.0f;
         for (const Source& src : b.targets[t]) {
+            if (!chorded.empty() && is_chorded(src)) continue;
             float v = source_value(src, st, b);
             if (!is_axis_source(src.kind)) {
                 dig = std::max(dig, v);
@@ -538,8 +594,11 @@ std::string source_label(const Source& s) {
 
 std::string default_config_path() {
     std::string dir;
+#ifndef __vita__
+    // Vita's base path is the read-only app0:, so there the file stays relative to the working directory.
     char* base = SDL_GetBasePath();
     if (base) { dir = base; SDL_free(base); }
+#endif
     return dir + "roguesq_input.json";
 }
 
@@ -622,6 +681,25 @@ bool load_bindings(Bindings& b, const std::string& path) {
             }
         }
     }
+
+    // "chords": [{ "target": "CRight", "sources": [ {source}, {source} ] }]
+    if (j.contains("chords") && j["chords"].is_array()) {
+        b.chords.clear();
+        for (const json& c : j["chords"]) {
+            if (!c.is_object() || !c.contains("target") || !c["target"].is_string() || !c.contains("sources") || !c["sources"].is_array()) continue;
+            const std::string target = c["target"].get<std::string>();
+            Chord chord;
+            bool found = false;
+            for (int t = 0; t < (int)Target::Count && !found; ++t) {
+                if (target == target_name((Target)t)) { chord.target = (Target)t; found = true; }
+            }
+            for (const json& e : c["sources"]) {
+                Source s;
+                if (source_from_json(e, s) && (s.dev < (int)b.joy_devices.size())) chord.sources.push_back(s);
+            }
+            if (found && (chord.sources.size() >= 2)) b.chords.push_back(chord);
+        }
+    }
     return true;
 }
 
@@ -664,6 +742,16 @@ bool save_bindings(const Bindings& b, const std::string& path) {
         binds[target_name((Target)t)] = arr;
     }
     j["binds"] = binds;
+    json chords = json::array();
+    for (const Chord& c : b.chords) {
+        json sources = json::array();
+        for (const Source& s : c.sources) {
+            json o;
+            if (source_to_json(s, o)) sources.push_back(o);
+        }
+        chords.push_back({ {"target", target_name(c.target)}, {"sources", sources} });
+    }
+    j["chords"] = chords;
 
     std::ofstream f(path, std::ios::trunc);
     if (!f.is_open()) return false;

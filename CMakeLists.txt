@@ -349,8 +349,13 @@ set(RS64_MAIN_SOURCES
     ${CMAKE_SOURCE_DIR}/src/main/register_overlays.cpp
     ${CMAKE_SOURCE_DIR}/src/main/upstream_compat.cpp
     ${CMAKE_SOURCE_DIR}/src/main/hook_helpers.cpp
+    ${CMAKE_SOURCE_DIR}/src/main/vg_capture.cpp
     ${CMAKE_SOURCE_DIR}/src/rsp/aspMain.cpp
     ${CMAKE_SOURCE_DIR}/src/rsp/dpc_bridge.cpp
+    ${CMAKE_SOURCE_DIR}/src/rsp/musyx_hle_runner.cpp
+    ${CMAKE_SOURCE_DIR}/src/rsp/musyx_hle/musyx.c
+    ${CMAKE_SOURCE_DIR}/src/rsp/musyx_hle/audio.c
+    ${CMAKE_SOURCE_DIR}/src/rsp/musyx_hle/memory.c
     ${FACTOR5_BOOT_C}
     ${FACTOR5_UCODE_C}
     ${MUSYX_AUDIO_C}
@@ -398,7 +403,8 @@ if (MSVC)
     # can switch to /FORCE:MULTIPLE only on the patched-symbol set via a
     # per-symbol .def or by carving out the patched .obj from RecompiledFuncs.
     target_link_options(RogueSquadron64Recomp PRIVATE /FORCE:MULTIPLE)
-else()
+elseif(NOT APPLE)
+    # ld64 has no equivalent; on Apple the runtime copies are weak (ULTRAMODERN_OVERRIDABLE) instead.
     # GNU ld equivalent of /FORCE:MULTIPLE. src/main overrides (osVi*_recomp in
     # upstream_compat.cpp, submit_rdp_range in rt64_render_context.cpp, and the
     # PatchesLib symbols) intentionally redefine symbols that also live in the

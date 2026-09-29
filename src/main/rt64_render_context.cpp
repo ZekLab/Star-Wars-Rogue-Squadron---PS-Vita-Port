@@ -27,6 +27,7 @@ extern SDL_Window* g_sdl_window;
 #include "debug_logs.h"
 #include "upstream_compat.h"      // rs64_vi_driven, rs64_fb_guards_mask, g_active_overlay, g_last_swap_fb
 #include "hook_helpers.h"         // g_boot_pulse_start, g_current_scene, rs64_cine_iter_get, rs64_neutralize_matpool_cimg
+#include "vg_capture.h"
 #include "game_state.h"           // rs64_state_poll, rs64_state_current_id
 #include "nav_sequencer.h"        // rs64_nav_set_target, rs64_nav_tick
 #include "rt64_render_context.h"  // create_render_context + submit_rdp_range (defined below)
@@ -510,6 +511,7 @@ public:
                         vi_count_, g_f5_heur[0], g_f5_heur[1], g_f5_heur[2], g_f5_heur[3]);
         }
         log_vi_state();
+        rs64_vg_capture_vi(ultramodern::renderer::get_vi_regs()->VI_ORIGIN_REG);
         maybe_persist_video_cfg();
         const auto pres0 = std::chrono::high_resolution_clock::now();
         app->updateScreen();
@@ -794,6 +796,7 @@ private:
         // back to live RDRAM.
         uint8_t* const parseMem = g_rs64_parse_rdram ? g_rs64_parse_rdram : app->core.RDRAM;
         rs64_neutralize_matpool_cimg(parseMem, (uint32_t)task->t.data_ptr & 0x3FFFFFF);
+        rs64_vg_capture_task(parseMem, (uint32_t)task->t.ucode & 0x3FFFFFF, (uint32_t)task->t.ucode_data & 0x3FFFFFF, (uint32_t)task->t.data_ptr & 0x3FFFFFF);
         const auto pdl0 = std::chrono::high_resolution_clock::now();
         app->state->RDRAM = parseMem;
         app->state->writeBackRDRAM = (parseMem != app->core.RDRAM) ? app->core.RDRAM : nullptr;

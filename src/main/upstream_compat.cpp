@@ -177,9 +177,13 @@ extern "C" void zmemcpy(uint8_t* rdram, recomp_context* ctx) {
 // Last osViSwapBuffer target; the present side reads it.
 extern "C" volatile unsigned g_last_swap_fb = 0;
 
+// Frames the game presented (one osViSwapBuffer per frame); read by the Vita render context's frame-rate log.
+extern "C" std::atomic<unsigned> g_rs64_swap_count{0};
+
 extern "C" void osViSwapBuffer_recomp(uint8_t* rdram, recomp_context* ctx) {
     const uint32_t fb = (uint32_t)ctx->r4;
     g_last_swap_fb = fb;
+    g_rs64_swap_count.fetch_add(1, std::memory_order_relaxed);
     static int s_count = 0;
     const int n = ++s_count;
     if (recomp::dbg::log_vi() && (n <= 200 || (n & 63) == 0)) {

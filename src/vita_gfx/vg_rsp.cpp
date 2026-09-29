@@ -1,0 +1,727 @@
+// RSP side of the Vita renderer: RT64's RSP (lib/rt64/src/hle/rt64_rsp.cpp) with its GPU workload pipeline replaced by
+// CPU vertex processing. Matrix/viewport/geometry-mode handling is ported as is; per-vertex transform, lighting, fog and
+// texgen follow RT64's RSPProcessCS.hlsl, and triangle culling/clipping follows RT64's drawIndexedTri.
+
+#include <algorithm>
+#include <cassert>
+#include <cmath>
+#include <cstdlib>
+#include <cstring>
+
+#include "../include/rt64_extended_gbi.h"
+#include "common/rt64_common.h"
+#include "common/rt64_math.h"
+#include "gbi/rt64_f3d.h"
+#include "gbi/rt64_gbi.h"
+#include "hle/rt64_interpreter.h"
+#include "hle/rt64_state.h"
+
+#include "vg_prof.h"
+#include "vg_renderer.h"
+
+namespace RT64 {
+    constexpr float DepthRange = 1024.0f;
+
+    static bool envFlag(const char *name, bool def) {
+        const char *e = std::getenv(name);
+        if (e == nullptr || e[0] == '\0') {
+            return def;
+        }
+        return e[0] != '0';
+    }
+
+    RSP::RSP(State *state) {
+        this->state = state;
+        NoN = false;
+        cullBothMask = 0;
+        cullFrontMask = 0;
+        projMask = 0;
+        loadMask = 0;
+        pushMask = 0;
+        shadingSmoothMask = 0;
+        segments.fill(0);
+        reset();
+    }
+
+    void RSP::reset() {
+        vg::ProfScope prof(vg::PROF_RSP_RESET);
+        modelMatrixStackSize = 1;
+        projectionMatrixStackSize = 1;
+        viewportStackSize = 1;
+        geometryModeStackSize = 1;
+        otherModeStackSize = 1;
+        modelMatrixStack.fill(hlslpp::float4x4(0.0f));
+        modelMatrixSegmentedAddressStack.fill(0);
+        modelMatrixPhysicalAddressStack.fill(0);
+        viewMatrixStack[0] = hlslpp::float4x4(0.0f);
+        projMatrixStack[0] = hlslpp::float4x4(0.0f);
+        viewProjMatrixStack[0] = hlslpp::float4x4(0.0f);
+        invViewProjMatrixStack[0] = hlslpp::float4x4(0.0f);
+        vertices.fill({});
+        indices.fill(0);
+        used.reset();
+        lights.fill({});
+        segments.fill(0);
+        viewportStack[0] = {};
+        clipRatios[0] = 1;
+        clipRatios[1] = 1;
+        clipRatios[2] = -1;
+        clipRatios[3] = -1;
+        textureState = {};
+        projectionIndex = -1;
+        projectionMatrixChanged = false;
+        projectionMatrixInversed = false;
+        viewportChanged = false;
+        modelViewProjMatrix = hlslpp::float4x4(0.0f);
+        modelViewProjChanged = false;
+        modelViewProjInserted = false;
+        lightCount = 0;
+        lightsChanged = false;
+        vertexColorPDAddress = 0;
+        fog.mul = 0.0f;
+        fog.offset = 0.0f;
+        lookAt.x = { 0.0f, 0.0f, 0.0f };
+        lookAt.y = { 0.0f, 0.0f, 0.0f };
+        otherModeStack[0].L = 0x0;
+        otherModeStack[0].H = 0x080CFF;
+        geometryModeStack[0] = G_CLIPPING;
+        fogChanged = true;
+        lookAtChanged = true;
+        clearExtended();
+    }
+
+    uint32_t RSP::fromSegmented(uint32_t segAddress) {
+        return segments[((segAddress) >> 24) & 0x0F] + ((segAddress) & 0x00FFFFFF);
+    }
+
+    uint32_t RSP::fromSegmentedMasked(uint32_t segAddress) {
+        return fromSegmented(segAddress) & 0x00FFFFF8;
+    }
+
+    uint32_t RSP::fromSegmentedMaskedPD(uint32_t segAddress) {
+        return fromSegmented(segAddress) & 0x00FFFFFC;
+    }
+
+    void RSP::setSegment(uint32_t seg, uint32_t address) {
+        segments[seg & (RSP_MAX_SEGMENTS - 1)] = address;
+    }
+
+    void RSP::matrixCommon(const hlslpp::float4x4 &floatMatrix, uint32_t address, uint8_t params) {
+        hlslpp::float4x4 &viewMatrix = viewMatrixStack[projectionMatrixStackSize - 1];
+        hlslpp::float4x4 &projMatrix = projMatrixStack[projectionMatrixStackSize - 1];
+        hlslpp::float4x4 &viewProjMatrix = viewProjMatrixStack[projectionMatrixStackSize - 1];
+        if (params & projMask) {
+            if (params & loadMask) {
+                viewProjMatrix = floatMatrix;
+                if (isMatrixViewProj(floatMatrix)) {
+                    matrixDecomposeViewProj(floatMatrix, viewMatrix, projMatrix);
+                }
+                else {
+                    projMatrix = floatMatrix;
+                    viewMatrix = hlslpp::float4x4::identity();
+                }
+            }
+            else {
+                viewProjMatrix = hlslpp::mul(floatMatrix, viewProjMatrix);
+                if (isMatrixAffine(floatMatrix) && !isMatrixIdentity(floatMatrix)) {
+                    viewMatrix = hlslpp::mul(floatMatrix, viewMatrix);
+                }
+                else {
+                    projMatrix = hlslpp::mul(floatMatrix, projMatrix);
+                }
+            }
+
+            projectionMatrixSegmentedAddressStack[projectionMatrixStackSize - 1] = address;
+            projectionMatrixPhysicalAddressStack[projectionMatrixStackSize - 1] = fromSegmentedMasked(address);
+            projectionMatrixChanged = true;
+            projectionMatrixInversed = false;
+        }
+        else {
+            if ((params & pushMask) && (modelMatrixStackSize < RSP_MATRIX_STACK_SIZE)) {
+                modelMatrixStackSize++;
+                modelMatrixStack[modelMatrixStackSize - 1] = modelMatrixStack[modelMatrixStackSize - 2];
+            }
+
+            if (params & loadMask) {
+                modelMatrixStack[modelMatrixStackSize - 1] = floatMatrix;
+            }
+            else {
+                modelMatrixStack[modelMatrixStackSize - 1] = hlslpp::mul(floatMatrix, modelMatrixStack[modelMatrixStackSize - 1]);
+            }
+
+            modelMatrixSegmentedAddressStack[modelMatrixStackSize - 1] = address;
+            modelMatrixPhysicalAddressStack[modelMatrixStackSize - 1] = fromSegmentedMasked(address);
+        }
+
+        modelViewProjChanged = true;
+    }
+
+    void RSP::matrix(uint32_t address, uint8_t params) {
+        const uint32_t rdramAddress = fromSegmentedMasked(address);
+        const FixedMatrix *fixedMatrix = reinterpret_cast<FixedMatrix *>(state->fromRDRAM(rdramAddress));
+        matrixCommon(fixedMatrix->toMatrix4x4(), address, params);
+    }
+
+    void RSP::popMatrix(uint32_t count) {
+        while (count--) {
+            if (modelMatrixStackSize > 1) {
+                modelMatrixStackSize--;
+                modelViewProjChanged = true;
+            }
+        }
+    }
+
+    void RSP::forceMatrix(uint32_t address) {
+        const uint32_t rdramAddress = fromSegmentedMasked(address);
+        const FixedMatrix *fixedMatrix = reinterpret_cast<FixedMatrix *>(state->fromRDRAM(rdramAddress));
+        modelViewProjMatrix = fixedMatrix->toMatrix4x4();
+        modelViewProjInserted = true;
+        modelViewProjChanged = false;
+    }
+
+    void RSP::computeModelViewProj() {
+        const hlslpp::float4x4 &viewProjMatrix = viewProjMatrixStack[projectionMatrixStackSize - 1];
+        modelViewProjMatrix = hlslpp::mul(modelMatrixStack[modelMatrixStackSize - 1], viewProjMatrix);
+        modelViewProjInserted = false;
+        modelViewProjChanged = false;
+    }
+
+    // Per-vertex processing (RSPProcessCS.hlsl on the CPU). Matrices use the row-vector convention of the CPU side
+    // (p * Model * ViewProj); the shader's mul(v, M) on the transposed upload becomes mul(M, v) here.
+    static hlslpp::float3 normalizeSafe(const hlslpp::float3 &v) {
+        const float l = hlslpp::length(v);
+        return (l > 0.0f) ? hlslpp::float3(v / l) : v;
+    }
+
+    void RSP::setVertex(uint32_t address, uint32_t vtxCount, uint32_t dstIndex) {
+        if ((dstIndex >= RSP_MAX_VERTICES) || ((dstIndex + vtxCount) > RSP_MAX_VERTICES)) {
+            return;
+        }
+
+        vg::ProfScope prof(vg::PROF_SET_VERTEX);
+        const uint32_t rdramAddress = fromSegmentedMasked(address);
+        const Vertex *dlVerts = reinterpret_cast<const Vertex *>(state->fromRDRAM(rdramAddress));
+        memcpy(&vertices[dstIndex], dlVerts, sizeof(Vertex) * vtxCount);
+
+        if (modelViewProjChanged) {
+            computeModelViewProj();
+        }
+
+        const uint32_t geometryMode = geometryModeStack[geometryModeStackSize - 1];
+        const bool usesLighting = (geometryMode & G_LIGHTING) != 0;
+        const bool usesFog = (geometryMode & G_FOG) != 0;
+        const bool usesTextureGen = (geometryMode & (G_LIGHTING | G_TEXTURE_GEN)) == (G_LIGHTING | G_TEXTURE_GEN);
+        const bool textureGenLinear = (geometryMode & G_TEXTURE_GEN_LINEAR) != 0;
+        const hlslpp::float4x4 &mvp = modelViewProjMatrix;
+        // Only lighting and texgen need the world matrix; a 4x4 product per call is noticeable on the Vita.
+        hlslpp::float4x4 worldMatrix;
+        if (usesLighting || usesTextureGen) {
+            worldMatrix = hlslpp::mul(modelMatrixStack[modelMatrixStackSize - 1], extended.viewProjMatrix);
+        }
+        const interop::RSPViewport &viewport = viewportStack[viewportStackSize - 1];
+
+        // Light directions in model space are shared by the whole batch.
+        hlslpp::float3 localLightDirs[RSP_MAX_LIGHTS];
+        hlslpp::float3 lightColors[RSP_MAX_LIGHTS + 1];
+        int dirLights = 0;
+        if (usesLighting) {
+            dirLights = std::min<int>(lightCount, RSP_MAX_LIGHTS);
+            for (int l = 0; l <= dirLights; l++) {
+                const Light &light = lights[l];
+                lightColors[l] = hlslpp::float3(light.dir.colr / 255.0f, light.dir.colg / 255.0f, light.dir.colb / 255.0f);
+                if (l < dirLights) {
+                    const hlslpp::float3 dir(float(light.dir.dirx), float(light.dir.diry), float(light.dir.dirz));
+                    localLightDirs[l] = normalizeSafe(hlslpp::mul(worldMatrix, hlslpp::float4(dir, 0.0f)).xyz);
+                }
+            }
+        }
+
+        hlslpp::float3 lookAtX, lookAtY;
+        if (usesTextureGen) {
+            lookAtX = normalizeSafe(hlslpp::mul(worldMatrix, hlslpp::float4(hlslpp::float3(lookAt.x), 0.0f)).xyz);
+            lookAtY = normalizeSafe(hlslpp::mul(worldMatrix, hlslpp::float4(hlslpp::float3(lookAt.y), 0.0f)).xyz);
+        }
+
+        Workload &workload = state->ext.workloadQueue->workloads[state->ext.workloadQueue->writeCursor];
+        auto &posTransformed = workload.drawData.posTransformed;
+        auto &posScreen = workload.drawData.posScreen;
+        vg::Renderer &renderer = *state->renderer;
+        const float sc = float(textureState.sc);
+        const float tc = float(textureState.tc);
+        // Divisions are slow on the Vita's VFP: multiply by reciprocals (differences stay within an ulp).
+        constexpr float Inv127 = 1.0f / 127.0f;
+        constexpr float Inv255 = 1.0f / 255.0f;
+        // Exact: the int32 product is rounded once either way, and the divisor is a power of two.
+        constexpr float InvTexDivisor = 1.0f / (65536.0f * 32.0f);
+        for (uint32_t i = dstIndex; i < dstIndex + vtxCount; i++) {
+            const Vertex &v = vertices[i];
+            const hlslpp::float4 tfPos = hlslpp::mul(hlslpp::float4(float(v.x), float(v.y), float(v.z), 1.0f), mvp);
+            float w = float(tfPos.w);
+            if (w == 0.0f) {
+                w = 1e-6f;
+            }
+
+            const float invW = 1.0f / w;
+            const hlslpp::float3 ps = (tfPos.xyz * hlslpp::float3(invW, -invW, invW)) * viewport.scale + viewport.translate;
+            posTransformed.emplace_back(tfPos);
+            posScreen.emplace_back(ps);
+
+            vg::Vertex out;
+            out.x = float(ps.x);
+            out.y = float(ps.y);
+            out.z = float(ps.z);
+            out.w = w;
+
+            const hlslpp::float3 norm(v.normal.x * Inv127, v.normal.y * Inv127, v.normal.z * Inv127);
+            if (usesLighting) {
+                hlslpp::float3 result = lightColors[dirLights];
+                for (int l = 0; l < dirLights; l++) {
+                    result += hlslpp::max(hlslpp::dot(norm, localLightDirs[l]), hlslpp::float1(0.0f)) * lightColors[l];
+                }
+                result = hlslpp::min(result, hlslpp::float3(1.0f, 1.0f, 1.0f));
+                out.r = float(result.x);
+                out.g = float(result.y);
+                out.b = float(result.z);
+            }
+            else {
+                out.r = v.color.r * Inv255;
+                out.g = v.color.g * Inv255;
+                out.b = v.color.b * Inv255;
+            }
+
+            if (usesFog) {
+                const float fogAlpha = (std::max(float(tfPos.z), 0.0f) * invW) * fog.mul + fog.offset;
+                out.a = std::clamp(fogAlpha * Inv255, 0.0f, 1.0f);
+            }
+            else {
+                out.a = v.color.a * Inv255;
+            }
+
+            if (usesTextureGen) {
+                float gu = std::clamp(float(hlslpp::dot(norm, lookAtX)), -1.0f, 1.0f);
+                float gv = std::clamp(float(hlslpp::dot(norm, lookAtY)), -1.0f, 1.0f);
+                if (textureGenLinear) {
+                    gu = std::acos(-gu) * 325.94932f;
+                    gv = std::acos(-gv) * 325.94932f;
+                }
+                else {
+                    gu = (gu + 1.0f) * 512.0f;
+                    gv = (gv + 1.0f) * 512.0f;
+                }
+                out.s = (sc / 65536.0f) * gu;
+                out.t = (tc / 65536.0f) * gv;
+            }
+            else {
+                out.s = float(int32_t(v.s) * int32_t(textureState.sc)) * InvTexDivisor;
+                out.t = float(int32_t(v.t) * int32_t(textureState.tc)) * InvTexDivisor;
+            }
+
+            indices[i] = renderer.addVertex(out);
+            used[i] = false;
+        }
+    }
+
+    // Clip-space lerp between two processed vertices (matches RT64's appendClippedVertex).
+    uint32_t RSP::appendClippedVertex(uint32_t ga, uint32_t gb, float t) {
+        Workload &workload = state->ext.workloadQueue->workloads[state->ext.workloadQueue->writeCursor];
+        auto &posTransformed = workload.drawData.posTransformed;
+        auto &posScreen = workload.drawData.posScreen;
+        vg::Renderer &renderer = *state->renderer;
+        const hlslpp::float4 pt = posTransformed[ga] + (posTransformed[gb] - posTransformed[ga]) * t;
+        float w = float(pt.w);
+        if (w == 0.0f) {
+            w = 1e-6f;
+        }
+
+        const interop::RSPViewport &viewport = viewportStack[viewportStackSize - 1];
+        const hlslpp::float3 ps = (pt.xyz / hlslpp::float3(w, -w, w)) * viewport.scale + viewport.translate;
+        posTransformed.emplace_back(pt);
+        posScreen.emplace_back(ps);
+
+        const vg::Vertex a = renderer.vertex(ga);
+        const vg::Vertex b = renderer.vertex(gb);
+        auto lf = [t](float x, float y) { return x + (y - x) * t; };
+        vg::Vertex out;
+        out.x = float(ps.x);
+        out.y = float(ps.y);
+        out.z = float(ps.z);
+        out.w = w;
+        out.r = lf(a.r, b.r);
+        out.g = lf(a.g, b.g);
+        out.b = lf(a.b, b.b);
+        out.a = lf(a.a, b.a);
+        out.s = lf(a.s, b.s);
+        out.t = lf(a.t, b.t);
+        return renderer.addVertex(out);
+    }
+
+    void RSP::modifyVertex(uint16_t dstIndex, uint16_t dstAttribute, uint32_t value) {
+        if (dstIndex >= RSP_MAX_VERTICES) {
+            return;
+        }
+
+        vg::Renderer &renderer = *state->renderer;
+        Workload &workload = state->ext.workloadQueue->workloads[state->ext.workloadQueue->writeCursor];
+        auto &posTransformed = workload.drawData.posTransformed;
+        auto &posScreen = workload.drawData.posScreen;
+        uint32_t globalIndex = indices[dstIndex];
+        if (used[dstIndex]) {
+            // Already drawn this task: modify a copy so earlier triangles keep the old values.
+            posTransformed.emplace_back(posTransformed[globalIndex]);
+            posScreen.emplace_back(posScreen[globalIndex]);
+            const vg::Vertex copy = renderer.vertex(globalIndex);
+            globalIndex = renderer.addVertex(copy);
+            indices[dstIndex] = globalIndex;
+            used[dstIndex] = false;
+        }
+
+        vg::Vertex &v = renderer.vertex(globalIndex);
+        switch (dstAttribute) {
+        case G_MWO_POINT_RGBA:
+            v.r = ((value >> 24) & 0xFF) / 255.0f;
+            v.g = ((value >> 16) & 0xFF) / 255.0f;
+            v.b = ((value >> 8) & 0xFF) / 255.0f;
+            v.a = (value & 0xFF) / 255.0f;
+            break;
+        case G_MWO_POINT_ST:
+            v.s = int16_t((value >> 16) & 0xFFFF) / 32.0f;
+            v.t = int16_t(value & 0xFFFF) / 32.0f;
+            break;
+        case G_MWO_POINT_XYSCREEN:
+            v.x = int16_t((value >> 16) & 0xFFFF) / 4.0f;
+            v.y = int16_t(value & 0xFFFF) / 4.0f;
+            posScreen[globalIndex][0] = v.x;
+            posScreen[globalIndex][1] = v.y;
+            break;
+        case G_MWO_POINT_ZSCREEN:
+            v.z = value / 65536.0f;
+            posScreen[globalIndex][2] = v.z;
+            break;
+        default:
+            break;
+        }
+    }
+
+    void RSP::branchZ(uint32_t branchDl, uint16_t vtxIndex, uint32_t zValue, DisplayList **dl) {
+        const Workload &workload = state->ext.workloadQueue->workloads[state->ext.workloadQueue->writeCursor];
+        const uint32_t globalIndex = indices[vtxIndex];
+        const float screenZ = workload.drawData.posScreen[globalIndex][2] * DepthRange;
+        if (extended.forceBranch || (screenZ < zValue / 65536.0f)) {
+            *dl = reinterpret_cast<DisplayList *>(state->fromRDRAM(fromSegmentedMasked(branchDl))) - 1;
+        }
+    }
+
+    void RSP::setGeometryMode(uint32_t mask) {
+        geometryModeStack[geometryModeStackSize - 1] |= mask;
+        state->updateDrawStatusAttribute(DrawAttribute::GeometryMode);
+    }
+
+    void RSP::clearGeometryMode(uint32_t mask) {
+        geometryModeStack[geometryModeStackSize - 1] &= ~mask;
+        state->updateDrawStatusAttribute(DrawAttribute::GeometryMode);
+    }
+
+    void RSP::setViewport(uint32_t address) {
+        const uint32_t rdramAddress = fromSegmentedMasked(address);
+        const Vp_t *vp = reinterpret_cast<const Vp_t *>(state->fromRDRAM(rdramAddress));
+        interop::RSPViewport &viewport = viewportStack[viewportStackSize - 1];
+        viewport.scale.x = float(vp->vscale[1]) / 4.0f;
+        viewport.scale.y = float(vp->vscale[0]) / 4.0f;
+        viewport.scale.z = float(vp->vscale[3]) / DepthRange;
+        viewport.translate.x = float(vp->vtrans[1] + extended.global.viewportOffsetX) / 4.0f;
+        viewport.translate.y = float(vp->vtrans[0] + extended.global.viewportOffsetY) / 4.0f;
+        viewport.translate.z = float(vp->vtrans[3]) / DepthRange;
+        viewportChanged = true;
+    }
+
+    void RSP::setLight(uint8_t index, uint32_t address) {
+        if (index > RSP_MAX_LIGHTS) {
+            return;
+        }
+        const uint8_t *data = reinterpret_cast<const uint8_t *>(state->fromRDRAM(fromSegmentedMasked(address)));
+        memcpy(&lights[index], data, sizeof(Light));
+        lightsChanged = true;
+    }
+
+    void RSP::setLightColor(uint8_t index, uint32_t value) {
+        if (index > RSP_MAX_LIGHTS) {
+            return;
+        }
+        lights[index].raw.words[0] = value;
+        lights[index].raw.words[1] = value;
+        lightsChanged = true;
+    }
+
+    void RSP::setLightCount(uint8_t count) {
+        lightCount = count;
+        lightsChanged = true;
+    }
+
+    void RSP::setClipRatioEdge(uint8_t index, int16_t value) {
+        if (index < clipRatios.size()) {
+            clipRatios[index] = value;
+            viewportChanged = true;
+        }
+    }
+
+    void RSP::setClipRatioAll(int16_t value) {
+        setClipRatioEdge(0, value);
+        setClipRatioEdge(1, value);
+        setClipRatioEdge(2, -value);
+        setClipRatioEdge(3, -value);
+    }
+
+    void RSP::setLookAt(uint8_t index, uint32_t address) {
+        const DirLight *dirLight = reinterpret_cast<const DirLight *>(state->fromRDRAM(fromSegmentedMasked(address)));
+        auto &dstLookAt = (index == 1) ? lookAt.y : lookAt.x;
+        if ((dirLight->dirx != 0) || (dirLight->diry != 0) || (dirLight->dirz != 0)) {
+            dstLookAt = hlslpp::normalize(hlslpp::float3(float(dirLight->dirx), float(dirLight->diry), float(dirLight->dirz)));
+        }
+        else {
+            dstLookAt = { 0.0f, 0.0f, 0.0f };
+        }
+        lookAtChanged = true;
+    }
+
+    void RSP::setLookAtVectors(interop::float3 x, interop::float3 y) {
+        lookAt.x = x;
+        lookAt.y = y;
+        lookAtChanged = true;
+    }
+
+    void RSP::setFog(int16_t mul, int16_t offset) {
+        fog.mul = mul;
+        fog.offset = offset;
+        fogChanged = true;
+    }
+
+    void RSP::setTexture(uint8_t tile, uint8_t level, uint8_t on, uint16_t sc, uint16_t tc) {
+        textureState.tile = tile;
+        textureState.levels = level + 1;
+        textureState.on = on;
+        textureState.sc = sc;
+        textureState.tc = tc;
+        state->updateDrawStatusAttribute(DrawAttribute::Texture);
+    }
+
+    void RSP::setOtherModeL(uint32_t size, uint32_t off, uint32_t data) {
+        interop::OtherMode &otherMode = otherModeStack[otherModeStackSize - 1];
+        const uint32_t mask = uint32_t((((uint64_t)1 << size) - 1) << off);
+        otherMode.L = (otherMode.L & (~mask)) | data;
+        state->rdp->setOtherMode(otherMode.H, otherMode.L);
+    }
+
+    void RSP::setOtherModeH(uint32_t size, uint32_t off, uint32_t data) {
+        interop::OtherMode &otherMode = otherModeStack[otherModeStackSize - 1];
+        const uint32_t mask = uint32_t((((uint64_t)1 << size) - 1) << off);
+        otherMode.H = (otherMode.H & (~mask)) | data;
+        state->rdp->setOtherMode(otherMode.H, otherMode.L);
+    }
+
+    void RSP::setColorImage(uint8_t fmt, uint8_t siz, uint16_t width, uint32_t segAddress) {
+        state->rdp->setColorImage(fmt, siz, width, fromSegmented(segAddress));
+    }
+
+    void RSP::setDepthImage(uint32_t segAddress) {
+        state->rdp->setDepthImage(fromSegmented(segAddress));
+    }
+
+    void RSP::setTextureImage(uint8_t fmt, uint8_t siz, uint16_t width, uint32_t segAddress) {
+        state->rdp->setTextureImage(fmt, siz, width, fromSegmented(segAddress));
+    }
+
+    // Culling and frustum clipping as in RT64's drawIndexedTri (Factor 5 cull semantics, guard-band clip, dome rules).
+    void RSP::drawIndexedTri(uint32_t a, uint32_t b, uint32_t c, bool rawGlobalIndices) {
+        vg::ProfScope prof(vg::PROF_DRAW_TRI);
+        const uint32_t geometryMode = geometryModeStack[geometryModeStackSize - 1];
+        static const bool s_cullbothdraw = envFlag("ROGUESQ_F5_CULLBOTH_DRAW", true);
+        const bool doubleSided = !f5Cull && s_cullbothdraw && (geometryMode & cullBothMask) == cullBothMask;
+        if (!f5Cull && !s_cullbothdraw && (geometryMode & cullBothMask) == cullBothMask) {
+            return;
+        }
+
+        const uint32_t cullTestMask = f5Cull ? (cullBothMask & ~cullFrontMask) : cullBothMask;
+        static const bool s_nocull = envFlag("ROGUESQ_SKY_NOCULL", false);
+        if (!f5Cull && (geometryMode & cullBothMask) == cullFrontMask) {
+            std::swap(a, c);
+        }
+
+        uint32_t globalIndices[3];
+        if (rawGlobalIndices) {
+            globalIndices[0] = a;
+            globalIndices[1] = b;
+            globalIndices[2] = c;
+        }
+        else {
+            globalIndices[0] = indices[a];
+            globalIndices[1] = indices[b];
+            globalIndices[2] = indices[c];
+            used[a] = used[b] = used[c] = true;
+        }
+
+        Workload &workload = state->ext.workloadQueue->workloads[state->ext.workloadQueue->writeCursor];
+        vg::Renderer &renderer = *state->renderer;
+        const bool usesCulling = !s_nocull && !doubleSided && (geometryMode & cullTestMask);
+        auto visible = [&](uint32_t g0, uint32_t g1, uint32_t g2) {
+            if (!usesCulling) {
+                return true;
+            }
+            const auto &ps = workload.drawData.posScreen;
+            const hlslpp::float3 U = ps[g1] - ps[g0];
+            const hlslpp::float3 V = ps[g2] - ps[g0];
+            return float(hlslpp::cross(V, U).z) >= 0.0f;
+        };
+
+        constexpr float kNearW = 1e-4f;
+        constexpr float kGuard = 2.0f;
+        const bool degenerate = (globalIndices[0] == globalIndices[1]) || (globalIndices[1] == globalIndices[2]) || (globalIndices[0] == globalIndices[2]);
+        static const bool s_clip = !envFlag("ROGUESQ_F5_NO_NEAR_CLIP", false);
+        bool extreme = false;
+        bool anyNear = false;
+        if (s_clip && !degenerate) {
+            for (int i = 0; i < 3; i++) {
+                const hlslpp::float4 p = workload.drawData.posTransformed[globalIndices[i]];
+                const float pw = p.w, px = p.x, py = p.y;
+                if (pw <= kNearW) {
+                    extreme = true;
+                    anyNear = true;
+                    break;
+                }
+                if (std::fabs(px) > kGuard * pw || std::fabs(py) > kGuard * pw) {
+                    extreme = true;
+                    break;
+                }
+            }
+        }
+
+        static const bool s_pinAll = envFlag("ROGUESQ_F5_SKY_PIN_ALL", false);
+        const bool isDomeTri = cullBothMask != 0 && (geometryMode & cullBothMask) == cullBothMask &&
+                               (s_pinAll || (state->rdp->otherMode.L & G_ZS_PRIM) != 0);
+        static const bool s_domeNearDrop = envFlag("ROGUESQ_F5_DOME_NEAR_DROP", true);
+        if (anyNear && isDomeTri && s_domeNearDrop) {
+            return;
+        }
+
+        if (extreme) {
+            auto planeDist = [](const hlslpp::float4 &p, int plane) -> float {
+                const float x = p.x, y = p.y, w = p.w;
+                switch (plane) {
+                    case 0:  return w - kNearW;
+                    case 1:  return kGuard * w + x;
+                    case 2:  return kGuard * w - x;
+                    case 3:  return kGuard * w + y;
+                    default: return kGuard * w - y;
+                }
+            };
+
+            uint32_t poly[10] = { globalIndices[0], globalIndices[1], globalIndices[2] };
+            int polyN = 3;
+            for (int pl = 0; pl < 5 && polyN > 0; pl++) {
+                uint32_t out[10];
+                int outCnt = 0;
+                for (int i = 0; i < polyN; i++) {
+                    const uint32_t gA = poly[i];
+                    const uint32_t gB = poly[(i + 1) % polyN];
+                    const float dA = planeDist(workload.drawData.posTransformed[gA], pl);
+                    const float dB = planeDist(workload.drawData.posTransformed[gB], pl);
+                    const bool inA = dA >= 0.0f;
+                    const bool inB = dB >= 0.0f;
+                    if (inA && outCnt < 10) {
+                        out[outCnt++] = gA;
+                    }
+                    if ((inA != inB) && outCnt < 10) {
+                        out[outCnt++] = appendClippedVertex(gA, gB, dA / (dA - dB));
+                    }
+                }
+                polyN = outCnt;
+                std::copy(out, out + polyN, poly);
+            }
+
+            for (int f = 1; f + 1 < polyN; f++) {
+                if (visible(poly[0], poly[f], poly[f + 1])) {
+                    renderer.addTriangle(poly[0], poly[f], poly[f + 1]);
+                }
+            }
+            return;
+        }
+
+        const auto &posTransformed = workload.drawData.posTransformed;
+        const bool nearCrossing = (posTransformed[globalIndices[0]].w <= 0.0f) || (posTransformed[globalIndices[1]].w <= 0.0f) || (posTransformed[globalIndices[2]].w <= 0.0f);
+        if (!nearCrossing && !visible(globalIndices[0], globalIndices[1], globalIndices[2])) {
+            return;
+        }
+
+        renderer.addTriangle(globalIndices[0], globalIndices[1], globalIndices[2]);
+    }
+
+    void RSP::drawIndexedTri(uint32_t a, uint32_t b, uint32_t c) {
+        drawIndexedTri(a, b, c, false);
+    }
+
+    void RSP::matrixId(uint32_t id, bool push, bool proj, bool, uint8_t, uint8_t, uint8_t, uint8_t, uint8_t, uint8_t, uint8_t, uint8_t, uint8_t, uint8_t, uint8_t, uint8_t, bool idIsAddress, bool) {
+        // Transform ids only drive RT64's frame interpolation; keep the stacks balanced for popMatrixId.
+        if (idIsAddress) {
+            return;
+        }
+        auto &stack = proj ? extended.viewProjMatrixIdStack : extended.modelMatrixIdStack;
+        int &stackSize = proj ? extended.viewProjMatrixIdStackSize : extended.modelMatrixIdStackSize;
+        if (push && size_t(stackSize) < stack.size()) {
+            stackSize++;
+        }
+        stack[stackSize - 1].matrixId = id;
+    }
+
+    void RSP::popMatrixId(uint8_t count, bool proj) {
+        int &stackSize = proj ? extended.viewProjMatrixIdStackSize : extended.modelMatrixIdStackSize;
+        while ((count > 0) && (stackSize > 1)) {
+            count--;
+            stackSize--;
+        }
+    }
+
+    void RSP::clearExtended() {
+        extended.drawExtendedType = DrawExtendedType::None;
+        extended.drawExtendedData = {};
+        extended.viewportOriginStack[0] = G_EX_ORIGIN_NONE;
+        extended.global.viewportOrigin = G_EX_ORIGIN_NONE;
+        extended.global.viewportOffsetX = 0;
+        extended.global.viewportOffsetY = 0;
+        extended.modelMatrixIdStack[0] = TransformGroup();
+        extended.modelMatrixIdStackSize = 1;
+        extended.modelMatrixIdStackChanged = false;
+        extended.curModelMatrixIdGroupIndex = 0;
+        extended.viewProjMatrixIdStack[0] = TransformGroup();
+        extended.viewProjMatrixIdStackSize = 1;
+        extended.viewProjMatrixIdStackChanged = false;
+        extended.curViewProjMatrixIdGroupIndex = 0;
+        extended.viewMatrix = hlslpp::float4x4::identity();
+        extended.projMatrix = hlslpp::float4x4::identity();
+        extended.viewProjMatrix = hlslpp::float4x4::identity();
+        extended.invViewMatrix = hlslpp::float4x4::identity();
+        extended.invProjMatrix = hlslpp::float4x4::identity();
+        extended.invViewProjMatrix = hlslpp::float4x4::identity();
+        extended.vertexAddresses = {};
+        extended.baseSegmentAddresses = {};
+        extended.vertexSegmentEnabled = {};
+        extended.forceBranch = false;
+    }
+
+    void RSP::setGBI(GBI *gbi) {
+        NoN = gbi->flags.NoN;
+        if (gbi->ucode == GBIUCode::F3DFACTOR5) {
+            if (envFlag("ROGUESQ_F5_NON", false)) {
+                NoN = true;
+            }
+            f5Cull = envFlag("ROGUESQ_F5_CULL", true);
+        }
+        else {
+            f5Cull = false;
+        }
+        cullBothMask = gbi->constants[F3DENUM::G_CULL_BOTH];
+        cullFrontMask = gbi->constants[F3DENUM::G_CULL_FRONT];
+        projMask = gbi->constants[F3DENUM::G_MTX_PROJECTION];
+        loadMask = gbi->constants[F3DENUM::G_MTX_LOAD];
+        pushMask = gbi->constants[F3DENUM::G_MTX_PUSH];
+        shadingSmoothMask = gbi->constants[F3DENUM::G_SHADING_SMOOTH];
+    }
+};

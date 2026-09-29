@@ -12,7 +12,7 @@ using nlohmann::json;
 namespace rs64::touch {
     std::string config_path() {
         std::string dir;
-#ifndef RS64_TOUCH_NO_SDL
+#if !defined(RS64_TOUCH_NO_SDL) && !defined(__vita__)
         if (char* base = SDL_GetBasePath()) {
             dir = base;
             SDL_free(base);

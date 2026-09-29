@@ -20,9 +20,12 @@ static unsigned g_rs64_audio_underruns = 0;   // dry-queue arrivals (see queue_s
 #include "librecomp/game.hpp"
 #include "librecomp/rsp.hpp"
 #include "librecomp/mods.hpp"
+#ifndef __vita__
+// RT64 is not part of the Vita build (it has its own renderer); only the ImGui core is compiled there.
 #include "common/rt64_common.h"
-#include "imgui/imgui.h"
 #include "rhi/rt64_render_hooks.h"
+#endif
+#include "imgui/imgui.h"
 #include "input_bindings.h"
 #include "rumble.h"
 #include "touch_input.h"
@@ -37,6 +40,7 @@ static unsigned g_rs64_audio_underruns = 0;   // dry-queue arrivals (see queue_s
 
 #include "rt64_render_context.h"  // recomp::create_render_context
 #include "../rsp/dpc_bridge.h"    // rs64_dpc_drain_histogram
+#include "../rsp/musyx_hle_runner.h"  // native MusyX synth
 #include <mutex>
 
 using recomp::dbg::env_on;
@@ -54,6 +58,10 @@ using recomp::dbg::env_int;
 #ifdef __ANDROID__
 #include "android_host.h"
 #endif
+#ifdef __vita__
+#include "vita_host.h"
+#include "vita_controls_ui.h"
+#endif
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
@@ -68,6 +76,11 @@ using recomp::dbg::env_int;
 // SDL_syswm.h is only needed for the Win32 HWND path in create_window(); on
 // Linux it pulls X11 <Xlib.h>, whose None/Bool/Status macros collide with C++
 // enum members (e.g. ultramodern::input::Pak::None), so it is not included here.
+#ifdef __APPLE__
+// macOS needs the Cocoa window and a Metal layer for RT64's Metal backend.
+#include "SDL2/SDL_syswm.h"
+#include "SDL2/SDL_metal.h"
+#endif
 static inline uint64_t GetTickCount64() {
     return (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -411,8 +424,31 @@ static RspExitReason musyx_audio_runner(uint8_t* rdram, uint32_t ucode_addr) {
                     s_n, (uint32_t)g_audio_task.t.data_ptr, (uint32_t)g_audio_task.t.data_size, base); fflush(stderr);
         }
     }
-    RspExitReason r = musyx_audio(rdram, ucode_addr);
+#ifdef __vita__
+    const unsigned long long vita_cpu0 = rs64::vita::thread_cpu_us();
+#endif
+    // ROGUESQ_AUDIO_HLE selects the native MusyX synth (default on Vita); ROGUESQ_AUDIO_HLE_VERIFY diffs it against the recompiled one.
+    RspExitReason r = RspExitReason::Broke;
+    if (rs64_musyx_hle_verify_enabled()) {
+        rs64_musyx_hle_verify(rdram, dmem, [&](uint8_t* ram) { r = musyx_audio(ram, ucode_addr); });
+    } else if (rs64_musyx_hle_enabled()) {
+        rs64_musyx_hle_run(rdram, dmem);
+    } else {
+        r = musyx_audio(rdram, ucode_addr);
+    }
     auto t2 = std::chrono::steady_clock::now();
+#ifdef __vita__
+    // Wall time vs the thread's own run time separates synth cost from preemption by other threads on the core.
+    {
+        static double s_cpu_sum = 0;
+        static int s_cpu_n = 0;
+        s_cpu_sum += (double)(rs64::vita::thread_cpu_us() - vita_cpu0) / 1000.0;
+        if ((++s_cpu_n % 64) == 0) {
+            fprintf(stderr, "[vita-audio] last 64 synth tasks: cpu avg=%.2fms affinity=0x%X\n", s_cpu_sum / 64.0, rs64::vita::thread_affinity());
+            s_cpu_sum = 0;
+        }
+    }
+#endif
     // Did the synth produce ANY internal signal? Scan its DMEM work area (accumulation/voice
     // buffers live in DMEM 0x600..0xFC0). All-zero => synth bailed early (no active voice). This
     // isolates "ucode not processing voices" from "output not reaching RDRAM/AI".
@@ -743,7 +779,7 @@ static void queue_samples(int16_t* samples, size_t num_samples) {
         if (s_lo && (s_q <= 8 || (s_q & 255) == 0)) {
             size_t n = num_bytes / 2; int16_t mx = 0;
             for (size_t i = 0; i < n; ++i) { int16_t v = samples[i]; if (v < 0) v = -v; if (v > mx) mx = v; }
-            fprintf(stderr, "[queue_samples #%d] %zu bytes, peak_amp=%d %s queued=%u bytes (%.1f ms)\n", s_q, num_bytes, (int)mx, mx ? "<-AUDIBLE" : "(silence)", (unsigned)SDL_GetQueuedAudioSize(audio_device), audio_sample_rate ? SDL_GetQueuedAudioSize(audio_device) / 4.0 * 1000.0 / audio_sample_rate : 0.0);
+            fprintf(stderr, "[queue_samples #%d] %u bytes, peak_amp=%d %s queued=%u bytes (%.1f ms)\n", s_q, (unsigned)num_bytes, (int)mx, mx ? "<-AUDIBLE" : "(silence)", (unsigned)SDL_GetQueuedAudioSize(audio_device), audio_sample_rate ? SDL_GetQueuedAudioSize(audio_device) / 4.0 * 1000.0 / audio_sample_rate : 0.0);
             fflush(stderr);
         }
         // Production-rate gauge: frames/sec actually produced vs the device rate. <100%
@@ -1271,6 +1307,19 @@ extern "C" void rs64_menu_request_quit(void) {
 // from update_gfx (main thread) to toggle relative-mouse mode, so it is atomic.
 static rs64::input::Bindings g_bindings = rs64::input::default_bindings();
 static std::mutex            g_bindings_mtx;    // UI thread mutates, game thread reads
+
+rs64::input::Bindings rs64_input_bindings_snapshot() {
+    std::lock_guard<std::mutex> lk(g_bindings_mtx);
+    return g_bindings;
+}
+
+void rs64_input_bindings_edit(const std::function<void(rs64::input::Bindings&)>& edit) {
+    std::lock_guard<std::mutex> lk(g_bindings_mtx);
+    edit(g_bindings);
+    if (!rs64::input::save_bindings(g_bindings, rs64::input::default_config_path())) {
+        fprintf(stderr, "[input] could not save %s\n", rs64::input::default_config_path().c_str());
+    }
+}
 static std::atomic<bool>     g_show_controls{false};
 static std::atomic<bool>     g_mouse_capture{false};
 static float                 g_mouse_ax = 0.0f;   // accumulated relative motion this frame
@@ -1436,7 +1485,7 @@ static void close_gamepad(SDL_JoystickID id) {
         SDL_GameControllerClose(g_pads[i]);
         g_pads.erase(g_pads.begin() + (ptrdiff_t)i);
         if (!controller && !g_pads.empty()) controller = g_pads.front();
-        fprintf(stderr, "[input] gamepad removed (%zu left)\n", g_pads.size());
+        fprintf(stderr, "[input] gamepad removed (%u left)\n", (unsigned)g_pads.size());
         fflush(stderr);
         return;
     }
@@ -1923,7 +1972,12 @@ static void poll_input() {
         }
     }
     SDL_Event e;
+#if defined(__APPLE__) || defined(__vita__)
+    // AppKit events may only be pumped on the main thread (update_gfx does it); here only drain the queue.
+    while (SDL_PeepEvents(&e, 1, SDL_GETEVENT, SDL_FIRSTEVENT, SDL_LASTEVENT) > 0) {
+#else
     while (SDL_PollEvent(&e)) {
+#endif
         if (e.type == SDL_FINGERDOWN || e.type == SDL_FINGERMOTION || e.type == SDL_FINGERUP) {
             touch_event(e);
             continue;
@@ -2098,6 +2152,15 @@ static bool get_n64_input_live(int controller_num, uint16_t* buttons, float* x, 
         if (scripted_input(&sb, &sx, &sy)) { *buttons = sb; *x = sx; *y = sy; return true; }
     }
 
+#ifdef __vita__
+    // The Controller Settings editor reads the pad itself and holds the game's input while the screen is shown.
+    uint16_t editor_buttons = 0;
+    if (rs64::vita::controls_ui_poll(const_cast<const uint8_t*>(g_recomp_rdram_for_wp_raw), controller, &editor_buttons)) {
+        *buttons = editor_buttons; *x = 0.0f; *y = 0.0f;
+        return true;
+    }
+#endif
+
     // Resolve keyboard + gamepad + mouse through the bindings profile.
     rs64::input::RawState st;
     st.keys = SDL_GetKeyboardState(&st.keys_len);
@@ -2204,7 +2267,7 @@ static bool get_n64_input(int controller_num, uint16_t* buttons, float* x, float
                 }
                 fclose(f);
             }
-            fprintf(stderr, "[input-rec] loaded %zu entries (v%d) from %s\n", s_recs.size(), s_version, s_play_path);
+            fprintf(stderr, "[input-rec] loaded %u entries (v%d) from %s\n", (unsigned)s_recs.size(), s_version, s_play_path);
         }
         if ((s_version >= 4) && !s_recs.empty()) {
             // Every poll was recorded with its time, so serve the recorded sample nearest to now: at most half a poll off, and no lag builds up when the game polls at a slightly different rate.
@@ -2863,7 +2926,11 @@ ultramodern::renderer::WindowHandle create_window(ultramodern::gfx_callbacks_t::
     Uint32 window_flags = SDL_WINDOW_RESIZABLE | (hide_window ? SDL_WINDOW_HIDDEN : SDL_WINDOW_SHOWN);
     if (env_on("ROGUESQ_MAXIMIZED"))
         window_flags |= SDL_WINDOW_MAXIMIZED;
-#ifndef _WIN32
+#if defined(__APPLE__)
+    window_flags |= SDL_WINDOW_METAL;
+#elif defined(__vita__)
+    window_flags |= SDL_WINDOW_FULLSCREEN;
+#elif !defined(_WIN32)
     window_flags |= SDL_WINDOW_VULKAN;
 #endif
 #ifdef __ANDROID__
@@ -2894,6 +2961,11 @@ ultramodern::renderer::WindowHandle create_window(ultramodern::gfx_callbacks_t::
     SDL_VERSION(&wm.version);
     SDL_GetWindowWMInfo(sdl_window, &wm);
     return { wm.info.win.window };
+#elif defined(__APPLE__)
+    SDL_SysWMinfo wm{};
+    SDL_VERSION(&wm.version);
+    SDL_GetWindowWMInfo(sdl_window, &wm);
+    return { wm.info.cocoa.window, SDL_Metal_GetLayer(SDL_Metal_CreateView(sdl_window)) };
 #else
     return sdl_window;
 #endif
@@ -3285,6 +3357,13 @@ int main(int argc, char* argv[]) {
     std::filesystem::current_path(rs64::android::data_dir());
     rs64::android::install_bundled_mods();
 #endif
+#ifdef __vita__
+    // No console or shell on Vita: log to a file, read env from a file, run from ux0:data/RogueSquadronVita.
+    rs64::vita::init_paths_and_log();
+    rs64::vita::load_env_file();
+    rs64::vita::set_max_clocks();
+    rs64::vita::run_parser_bench();
+#endif
     if (int rc = apply_cli_args(argc, argv); rc >= 0) {
         return rc;
     }
@@ -3330,7 +3409,10 @@ int main(int argc, char* argv[]) {
             return a;
         });
     }
+#if !defined(__APPLE__) && !defined(__vita__)
+    // RT64's inspector has no Metal ImGui backend, so the host ImGui UI stays off on macOS; Vita has no RT64.
     RT64::SetRenderHookImgui(&draw_dev_ui);
+#endif
 
 #ifdef _WIN32
     // Log PE base so we can resolve absolute addresses from SEH logs to RVAs
@@ -3352,7 +3434,7 @@ int main(int argc, char* argv[]) {
     // as the fork's `if(false) fprintf` cruft, but stays in our repo.
     // GlobalLogFile only exists in RT64 debug builds (under !NDEBUG); in Release
     // the RT64_LOG_* macros are no-ops, so the redirect is both unneeded and uncompilable.
-#ifndef NDEBUG
+#if !defined(NDEBUG) && !defined(__vita__)
     if (FILE *nul = recomp::os::fopen(RS64_NULL_DEVICE, "w")) {
         RT64::GlobalLogFile = nul;
     } else {

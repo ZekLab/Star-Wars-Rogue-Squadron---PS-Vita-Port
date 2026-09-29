@@ -187,8 +187,8 @@ void apply_json(MenuConfig& m, const std::string& path, const std::string& mod_i
 MenuConfig default_config() {
     MenuConfig m;
 
-    // No quitting to desktop on Android; the system handles app exit.
-#ifndef __ANDROID__
+    // No quitting to desktop on Android or the Vita; the system handles app exit (on the Vita the quit path also crashed on shutdown).
+#if !defined(__ANDROID__) && !defined(__vita__)
     Button quit;
     quit.id = "quit";
     quit.menu = "main_menu";
@@ -213,10 +213,15 @@ MenuConfig default_config() {
 MenuConfig build_config() {
     MenuConfig m = default_config();
 
+#ifdef __vita__
+    // Vita's base path is the read-only app0:; the file sits in the working directory instead.
+    apply_json(m, "roguesq_menu.json", std::string{});
+#else
     if (char* base = SDL_GetBasePath()) {
         std::string dir = base; SDL_free(base);
         apply_json(m, dir + "roguesq_menu.json", std::string{});
     }
+#endif
     for (const auto& d : recomp::mods::get_all_mod_details("rs64")) {
         if (!recomp::mods::is_mod_enabled(d.mod_id)) continue;
         std::filesystem::path root = recomp::mods::get_mod_filename(d.mod_id);

@@ -87,8 +87,15 @@ struct LightbarConfig {
     uint32_t dead      = 0x200000;  // #200000
 };
 
+// Two or more inputs pressed together press `target`; while a chord is held its inputs do not also press their own targets.
+struct Chord {
+    std::vector<Source> sources;
+    Target target = Target::A;
+};
+
 struct Bindings {
     std::vector<Source> targets[(int)Target::Count];
+    std::vector<Chord> chords;
     std::vector<JoyDevice> joy_devices;
     float mouse_sensitivity = 0.05f;  // relative-pixel -> stick deflection
     float mouse_smoothing   = 0.3f;   // 0 = raw per-frame delta, higher = softer onset/recenter (time constant, ~ms/100)
@@ -118,6 +125,13 @@ struct RawState {
 };
 
 Bindings default_bindings();
+
+// Replaces every gamepad source and chord with the PS Vita layout, which reaches all N64 buttons: Cross A, Square B, Circle C-Down,
+// Triangle C-Up, Select Z, L, R, Start, D-pad, left stick = stick, right stick = the four C buttons.
+void apply_vita_pad_defaults(Bindings& b);
+
+// True when both describe the same physical input.
+bool same_source(const Source& a, const Source& b);
 
 // UI helpers.
 int         target_count();                    // == (int)Target::Count
