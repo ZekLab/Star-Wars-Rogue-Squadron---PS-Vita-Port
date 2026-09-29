@@ -127,10 +127,10 @@ extern "C" void osMotorStop_recomp(uint8_t* rdram, recomp_context* ctx) {
     _return<s32>(ctx, ret);
 }
 
-extern "C" void __osContRamRead_recomp(uint8_t* rdram, recomp_context* ctx) {
+extern "C" ULTRAMODERN_OVERRIDABLE void __osContRamRead_recomp(uint8_t* rdram, recomp_context* ctx) {
     _return<s32>(ctx, -1); // no rumble pak
 }
 
-extern "C" void __osContRamWrite_recomp(uint8_t* rdram, recomp_context* ctx) {
+extern "C" ULTRAMODERN_OVERRIDABLE void __osContRamWrite_recomp(uint8_t* rdram, recomp_context* ctx) {
     _return<s32>(ctx, -1); // no rumble pak
 }

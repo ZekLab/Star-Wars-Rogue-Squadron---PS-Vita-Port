@@ -14,11 +14,11 @@ static bool log_thread_lifecycle() {
     return on != 0;
 }
 
-extern "C" void osInitialize_recomp(uint8_t * rdram, recomp_context * ctx) {
+extern "C" ULTRAMODERN_OVERRIDABLE void osInitialize_recomp(uint8_t * rdram, recomp_context * ctx) {
     osInitialize();
 }
 
-extern "C" void __osInitialize_common_recomp(uint8_t * rdram, recomp_context * ctx) {
+extern "C" ULTRAMODERN_OVERRIDABLE void __osInitialize_common_recomp(uint8_t * rdram, recomp_context * ctx) {
     osInitialize();
 }
 
@@ -35,7 +35,7 @@ extern "C" void osCreateThread_recomp(uint8_t* rdram, recomp_context* ctx) {
     }
 }
 
-extern "C" void osStartThread_recomp(uint8_t* rdram, recomp_context* ctx) {
+extern "C" ULTRAMODERN_OVERRIDABLE void osStartThread_recomp(uint8_t* rdram, recomp_context* ctx) {
     OSThread* t = TO_PTR(OSThread, (int32_t)ctx->r4);
     if (log_thread_lifecycle()) {
         printf("[DEBUG] osStartThread: t=0x%08X id=%d pri=%d state=0x%04X\n",
@@ -47,15 +47,15 @@ extern "C" void osStartThread_recomp(uint8_t* rdram, recomp_context* ctx) {
     }
 }
 
-extern "C" void osStopThread_recomp(uint8_t * rdram, recomp_context * ctx) {
+extern "C" ULTRAMODERN_OVERRIDABLE void osStopThread_recomp(uint8_t * rdram, recomp_context * ctx) {
     osStopThread(rdram, (int32_t)ctx->r4);
 }
 
-extern "C" void osDestroyThread_recomp(uint8_t * rdram, recomp_context * ctx) {
+extern "C" ULTRAMODERN_OVERRIDABLE void osDestroyThread_recomp(uint8_t * rdram, recomp_context * ctx) {
     osDestroyThread(rdram, (int32_t)ctx->r4);
 }
 
-extern "C" void osYieldThread_recomp(uint8_t * rdram, recomp_context * ctx) {
+extern "C" ULTRAMODERN_OVERRIDABLE void osYieldThread_recomp(uint8_t * rdram, recomp_context * ctx) {
     // TODO: proper cooperative yield. ultramodern::check_running_queue(rdram)
     // crashed (null deref) at frame ~25. std::this_thread::yield() is a host-OS
     // yield, not a recomp thread swap, but at least it's stable.
@@ -78,11 +78,11 @@ extern "C" void osCreateMesgQueue_recomp(uint8_t* rdram, recomp_context* ctx) {
     osCreateMesgQueue(rdram, (int32_t)ctx->r4, (int32_t)ctx->r5, (s32)ctx->r6);
 }
 
-extern "C" void osRecvMesg_recomp(uint8_t* rdram, recomp_context* ctx) {
+extern "C" ULTRAMODERN_OVERRIDABLE void osRecvMesg_recomp(uint8_t* rdram, recomp_context* ctx) {
     ctx->r2 = osRecvMesg(rdram, (int32_t)ctx->r4, (int32_t)ctx->r5, (s32)ctx->r6);
 }
 
-extern "C" void osSendMesg_recomp(uint8_t* rdram, recomp_context* ctx) {
+extern "C" ULTRAMODERN_OVERRIDABLE void osSendMesg_recomp(uint8_t* rdram, recomp_context* ctx) {
     uint32_t mq = (uint32_t)ctx->r4;
     // Log every send to the frame-thread's recv2 queue at 0x80128D10. Rate-limit
     // others so we can see who's sending what.

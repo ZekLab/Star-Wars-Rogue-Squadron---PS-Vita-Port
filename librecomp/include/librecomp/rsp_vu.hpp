@@ -24,7 +24,8 @@
 #define ARCHITECTURE_SUPPORTS_SSE4_1 1
 #include <nmmintrin.h>
 using v128 = __m128i;
-#elif defined(__aarch64__) || defined(_M_ARM64)
+#elif defined(__aarch64__) || defined(_M_ARM64) || (defined(__arm__) && defined(__ARM_NEON))
+// ARMv7 with NEON (e.g. PS Vita) uses the same sse2neon mapping as AArch64 instead of the scalar fallback.
 #define ARCHITECTURE_SUPPORTS_SSE4_1 1
 #include <sse2neon.h>
 using v128 = __m128i;

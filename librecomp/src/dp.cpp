@@ -1,5 +1,12 @@
 #include "recomp.h"
 
+// Same as ultramodern/ultra64.h, which this file can't include (it redefines RDPStatusBit).
+#ifdef __APPLE__
+#define ULTRAMODERN_OVERRIDABLE __attribute__((weak))
+#else
+#define ULTRAMODERN_OVERRIDABLE
+#endif
+
 enum class RDPStatusBit {
     XbusDmem = 0,
     Freeze = 1,
@@ -43,7 +50,7 @@ extern "C" void osDpSetStatus_recomp(uint8_t* rdram, recomp_context* ctx) {
     update_bit(rdp_state, ctx->r4, RDPStatusBit::Flush);
 }
 
-extern "C" void osDpGetCounters_recomp(uint8_t* rdram, recomp_context* ctx) {
+extern "C" ULTRAMODERN_OVERRIDABLE void osDpGetCounters_recomp(uint8_t* rdram, recomp_context* ctx) {
     // Counter buffer pointer in r4 — write zeroes for all 8 counters.
     // buf_ptr must stay 64-bit so the sign-extended MIPS address (e.g. 0xFFFFFFFF80...)
     // survives the `- 0xFFFFFFFF80000000` subtraction inside MEM_W. Truncating to

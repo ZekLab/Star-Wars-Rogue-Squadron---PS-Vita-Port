@@ -2,6 +2,7 @@
 #define __ultramodern_HPP__
 
 #include <thread>
+#include <vector>
 #include <cassert>
 #include <stdexcept>
 #include <span>
@@ -101,6 +102,10 @@ enum class ThreadPriority {
 
 void set_native_thread_name(const std::string& name);
 void set_native_thread_priority(ThreadPriority pri);
+#ifdef __vita__
+// (native thread id, name) for every thread named so far; Vita has no thread renaming, so names live here.
+std::vector<std::pair<int, std::string>> vita_named_threads();
+#endif
 PTR(OSThread) this_thread();
 void set_main_thread();
 bool is_game_thread();

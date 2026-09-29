@@ -60,7 +60,29 @@ if (WIN32)
 endif()
 
 add_subdirectory(${PROJECT_SOURCE_DIR}/../thirdparty/miniz ${CMAKE_CURRENT_BINARY_DIR}/miniz)
-add_subdirectory(${PROJECT_SOURCE_DIR}/../N64Recomp ${CMAKE_CURRENT_BINARY_DIR}/N64Recomp EXCLUDE_FROM_ALL)
 
-target_link_libraries(librecomp PRIVATE ultramodern N64Recomp LiveRecomp)
+if (VITA)
+    # PS Vita: no dynamic libraries, no executable memory for the live recompiler, no POSIX signals.
+    # Mod support is replaced by no-op stubs and the recompiler library is not linked.
+    set(LIBRECOMP_VITA_EXCLUDED
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/mods.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/mod_events.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/mod_hooks.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/mod_manifest.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/mod_config_api.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/fault_guard.cpp"
+    )
+    get_target_property(LIBRECOMP_SOURCES librecomp SOURCES)
+    list(REMOVE_ITEM LIBRECOMP_SOURCES ${LIBRECOMP_VITA_EXCLUDED})
+    list(APPEND LIBRECOMP_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/mods_disabled.cpp")
+    set_target_properties(librecomp PROPERTIES SOURCES "${LIBRECOMP_SOURCES}")
+    target_include_directories(librecomp PUBLIC
+        "${PROJECT_SOURCE_DIR}/../N64Recomp/include"
+        "${PROJECT_SOURCE_DIR}/../N64Recomp/lib/rabbitizer/include"
+        "${PROJECT_SOURCE_DIR}/../N64Recomp/lib/rabbitizer/cplusplus/include")
+    target_link_libraries(librecomp PRIVATE ultramodern)
+else()
+    add_subdirectory(${PROJECT_SOURCE_DIR}/../N64Recomp ${CMAKE_CURRENT_BINARY_DIR}/N64Recomp EXCLUDE_FROM_ALL)
+    target_link_libraries(librecomp PRIVATE ultramodern N64Recomp LiveRecomp)
+endif()
 target_link_libraries(librecomp PUBLIC miniz)

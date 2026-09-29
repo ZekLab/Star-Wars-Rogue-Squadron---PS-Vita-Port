@@ -24,6 +24,8 @@ extern "C" {
 }
 #elif defined(__MACH__)
 #include <mach/mach.h>
+#elif defined(__vita__)
+#include <psp2/kernel/threadmgr.h>
 #elif defined(__unix__)
 #include <semaphore.h>
 
@@ -251,6 +253,58 @@ public:
 		{
 			while (sem_post(&m_sema) == -1);
 		}
+	}
+};
+#elif defined(__vita__)
+//---------------------------------------------------------
+// Semaphore (PS Vita kernel semaphore; timeouts are relative, in microseconds)
+//---------------------------------------------------------
+class Semaphore
+{
+private:
+	SceUID m_sema;
+
+	Semaphore(const Semaphore& other) MOODYCAMEL_DELETE_FUNCTION;
+	Semaphore& operator=(const Semaphore& other) MOODYCAMEL_DELETE_FUNCTION;
+
+public:
+	Semaphore(int initialCount = 0)
+	{
+		assert(initialCount >= 0);
+		m_sema = sceKernelCreateSema("mc_sema", 0, initialCount, 0x7FFFFFFF, NULL);
+		assert(m_sema >= 0);
+	}
+
+	~Semaphore()
+	{
+		sceKernelDeleteSema(m_sema);
+	}
+
+	bool wait()
+	{
+		return sceKernelWaitSema(m_sema, 1, NULL) >= 0;
+	}
+
+	bool try_wait()
+	{
+		return sceKernelPollSema(m_sema, 1) >= 0;
+	}
+
+	bool timed_wait(std::uint64_t usecs)
+	{
+		SceUInt timeout = usecs > 0xFFFFFFFFull ? 0xFFFFFFFFu : static_cast<SceUInt>(usecs);
+		return sceKernelWaitSema(m_sema, 1, &timeout) >= 0;
+	}
+
+	void signal()
+	{
+		sceKernelSignalSema(m_sema, 1);
+	}
+
+	void signal(int count)
+	{
+		if (count > 0)
+			sceKernelSignalSema(m_sema, count);
 	}
 };
 #else

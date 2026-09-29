@@ -11,6 +11,9 @@
 #include "librecomp/overlays.hpp"
 #include <ultramodern/ultra64.h>
 #include <ultramodern/ultramodern.hpp>
+#ifdef __vita__
+#include <psp2/io/fcntl.h>
+#endif
 
 static std::vector<uint8_t> rom;
 
@@ -137,6 +140,12 @@ void update_save_file() {
     if (!saving_failed) {
         saving_failed = !recomp::finalize_output_file_with_backup(ultramodern::get_save_file_path());
     }
+#ifdef __vita__
+    // Commit to the memory card now: the app is usually closed from the PS button, right after the game saves.
+    if (!saving_failed) {
+        sceIoSync("ux0:", 0);
+    }
+#endif
     if (saving_failed) {
         ultramodern::error_handling::message_box("Failed to write to the save file. Check your file permissions and whether the save folder has been moved to Dropbox or similar, as this can cause issues.");
     }
@@ -242,10 +251,16 @@ void read_save_file() {
     std::ifstream save_file = recomp::open_input_file_with_backup(save_file_path, std::ios_base::binary);
     if (save_file.good()) {
         save_file.read(save_context.save_buffer.data(), save_context.save_buffer.size());
+#ifdef __vita__
+        fprintf(stderr, "[save] read %d of %u bytes from %s\n", int(save_file.gcount()), unsigned(save_context.save_buffer.size()), save_file_path.string().c_str());
+#endif
     }
     else {
         // Otherwise clear the save file to all zeroes.
         std::fill(save_context.save_buffer.begin(), save_context.save_buffer.end(), 0);
+#ifdef __vita__
+        fprintf(stderr, "[save] no save file at %s, starting empty\n", save_file_path.string().c_str());
+#endif
     }
 }
 

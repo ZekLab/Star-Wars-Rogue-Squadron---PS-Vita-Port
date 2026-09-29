@@ -59,6 +59,6 @@ extern "C" void osPfsRepairId_recomp(uint8_t * rdram, recomp_context * ctx) {
     _return<s32>(ctx, 1); // PFS_ERR_NOPACK
 }
 
-extern "C" void __osPfsSelectBank_recomp(uint8_t* rdram, recomp_context* ctx) {
+extern "C" ULTRAMODERN_OVERRIDABLE void __osPfsSelectBank_recomp(uint8_t* rdram, recomp_context* ctx) {
     _return<s32>(ctx, 1); // PFS_ERR_NOPACK — no memory pak
 }

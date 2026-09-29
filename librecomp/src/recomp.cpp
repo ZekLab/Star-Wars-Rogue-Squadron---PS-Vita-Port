@@ -29,6 +29,8 @@
 #ifdef _WIN32
 #    define WIN32_LEAN_AND_MEAN
 #    include <Windows.h>
+#elif defined(__vita__)
+#    include <psp2/kernel/sysmem.h>
 #else
 #    include <sys/mman.h>
 #endif
@@ -399,7 +401,7 @@ recomp::RomValidationError recomp::select_rom(const std::filesystem::path& rom_p
     return recomp::RomValidationError::Good;
 }
 
-extern "C" void osGetMemSize_recomp(uint8_t * rdram, recomp_context * ctx) {
+extern "C" ULTRAMODERN_OVERRIDABLE void osGetMemSize_recomp(uint8_t * rdram, recomp_context * ctx) {
     ctx->r2 = 8 * 1024 * 1024;
 }
 
@@ -533,6 +535,9 @@ void run_thread_function(uint8_t* rdram, uint64_t addr, uint64_t sp, uint64_t ar
         fprintf(stderr, "\n");
         fflush(stderr);
     }
+#elif defined(__vita__)
+    // No POSIX signals on Vita: a guest fault is fatal, as on real hardware.
+    invoke_recomp_func(func, rdram, &ctx);
 #else
     // POSIX counterpart of the SEH wrapper above: a guest fault ends this thread instead of the process.
     struct GuardedCall { recomp_func_t* func; uint8_t* rdram; recomp_context* ctx; } call{ func, rdram, &ctx };
@@ -874,6 +879,20 @@ void recomp::start(const recomp::Configuration& cfg) {
             VirtualFree(rdram, 0, MEM_RELEASE);
         }
     }
+#elif defined(__vita__)
+    // Vita: one plain RW block, zeroed; no reserved guard region exists on a 32-bit host.
+    static SceUID rdram_block = -1;
+    rdram_block = sceKernelAllocMemBlock("rdram", SCE_KERNEL_MEMBLOCK_TYPE_USER_RW, allocation_size, NULL);
+    alloc_failed = rdram_block < 0;
+    rdram = nullptr;
+    if (!alloc_failed) {
+        void* base = nullptr;
+        alloc_failed = sceKernelGetMemBlockBase(rdram_block, &base) < 0;
+        rdram = reinterpret_cast<uint8_t*>(base);
+        if (!alloc_failed) {
+            memset(rdram, 0, allocation_size);
+        }
+    }
 #else
     rdram = (uint8_t*)mmap(NULL, allocation_size, PROT_NONE, MAP_ANON | MAP_PRIVATE, -1, 0);
     alloc_failed = rdram == reinterpret_cast<uint8_t*>(MAP_FAILED);
@@ -932,6 +951,8 @@ void recomp::start(const recomp::Configuration& cfg) {
 #ifdef _WIN32
     // VirtualFree returns zero on failure.
     free_failed = (VirtualFree(rdram, 0, MEM_RELEASE) == 0);
+#elif defined(__vita__)
+    free_failed = (sceKernelFreeMemBlock(rdram_block) < 0);
 #else
     // munmap returns -1 on failure.
     free_failed = (munmap(rdram, allocation_size) == -1);

@@ -67,7 +67,26 @@ static inline void DMULTU(uint64_t a, uint64_t b, uint64_t* lo64, uint64_t* hi64
 }
 
 #else
-#error "128-bit integer type not found"
+
+// 32-bit hosts (e.g. ARMv7): build the 128-bit product from 32-bit halves.
+static inline void DMULTU(uint64_t a, uint64_t b, uint64_t* lo64, uint64_t* hi64) {
+    uint64_t a_lo = (uint32_t)a, a_hi = a >> 32, b_lo = (uint32_t)b, b_hi = b >> 32;
+    uint64_t p0 = a_lo * b_lo, p1 = a_lo * b_hi, p2 = a_hi * b_lo, p3 = a_hi * b_hi;
+    uint64_t mid = (p0 >> 32) + (uint32_t)p1 + (uint32_t)p2;
+    *lo64 = (mid << 32) | (uint32_t)p0;
+    *hi64 = p3 + (p1 >> 32) + (p2 >> 32) + (mid >> 32);
+}
+
+// Signed high word = unsigned high word minus the other operand for each negative operand.
+static inline void DMULT(int64_t a, int64_t b, int64_t* lo64, int64_t* hi64) {
+    uint64_t lo, hi;
+    DMULTU((uint64_t)a, (uint64_t)b, &lo, &hi);
+    if (a < 0) hi -= (uint64_t)b;
+    if (b < 0) hi -= (uint64_t)a;
+    *lo64 = (int64_t)lo;
+    *hi64 = (int64_t)hi;
+}
+
 #endif
 
 static inline void DDIV(int64_t a, int64_t b, int64_t* quot, int64_t* rem) {

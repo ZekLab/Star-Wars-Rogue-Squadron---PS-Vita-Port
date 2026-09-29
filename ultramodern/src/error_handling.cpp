@@ -21,7 +21,7 @@ void ultramodern::error_handling::message_box(const char* msg) {
 void ultramodern::error_handling::quick_exit(const char* filename, int line, const char *func, int exit_status) {
     fprintf(stderr, "Exiting with exit status '%i'. Function %s, at file %s:%i\n", exit_status, func, filename, line);
 
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(__vita__)
     std::_Exit(exit_status);
 #else
     std::quick_exit(exit_status);

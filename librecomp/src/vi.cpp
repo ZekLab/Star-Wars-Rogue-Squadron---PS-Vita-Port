@@ -6,11 +6,11 @@
 #include <cstdio>
 #include <cstdlib>
 
-extern "C" void osViSetYScale_recomp(uint8_t* rdram, recomp_context * ctx) {
+extern "C" ULTRAMODERN_OVERRIDABLE void osViSetYScale_recomp(uint8_t* rdram, recomp_context * ctx) {
     osViSetYScale(ctx->f12.fl);
 }
 
-extern "C" void osViSetXScale_recomp(uint8_t* rdram, recomp_context * ctx) {
+extern "C" ULTRAMODERN_OVERRIDABLE void osViSetXScale_recomp(uint8_t* rdram, recomp_context * ctx) {
     osViSetXScale(ctx->f12.fl);
 }
 
@@ -18,7 +18,7 @@ extern "C" void osCreateViManager_recomp(uint8_t* rdram, recomp_context* ctx) {
     ;
 }
 
-extern "C" void osViBlack_recomp(uint8_t* rdram, recomp_context* ctx) {
+extern "C" ULTRAMODERN_OVERRIDABLE void osViBlack_recomp(uint8_t* rdram, recomp_context* ctx) {
     osViBlack((uint32_t)ctx->r4);
 }
 
@@ -38,17 +38,17 @@ extern "C" void osViGetNextFramebuffer_recomp(uint8_t* rdram, recomp_context* ct
     ctx->r2 = (gpr)(int32_t)osViGetNextFramebuffer();
 }
 
-extern "C" void osViSwapBuffer_recomp(uint8_t* rdram, recomp_context* ctx) {
+extern "C" ULTRAMODERN_OVERRIDABLE void osViSwapBuffer_recomp(uint8_t* rdram, recomp_context* ctx) {
     osViSwapBuffer(rdram, (int32_t)ctx->r4);
 }
 
-extern "C" void osViSetMode_recomp(uint8_t* rdram, recomp_context* ctx) {
+extern "C" ULTRAMODERN_OVERRIDABLE void osViSetMode_recomp(uint8_t* rdram, recomp_context* ctx) {
     osViSetMode(rdram, (int32_t)ctx->r4);
 }
 
 extern uint64_t total_vis;
 
-extern "C" void osViGetCurrentField_recomp(uint8_t* rdram, recomp_context* ctx) {
+extern "C" ULTRAMODERN_OVERRIDABLE void osViGetCurrentField_recomp(uint8_t* rdram, recomp_context* ctx) {
     ctx->r2 = 0; // always field 0 (progressive / non-interlaced)
 }
 

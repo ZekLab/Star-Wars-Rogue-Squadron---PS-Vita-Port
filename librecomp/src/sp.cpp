@@ -10,7 +10,7 @@ extern "C" void osSpTaskLoad_recomp(uint8_t* rdram, recomp_context* ctx) {
 
 bool dump_frame = false;
 
-extern "C" void osSpTaskStartGo_recomp(uint8_t* rdram, recomp_context* ctx) {
+extern "C" ULTRAMODERN_OVERRIDABLE void osSpTaskStartGo_recomp(uint8_t* rdram, recomp_context* ctx) {
     OSTask* task = TO_PTR(OSTask, ctx->r4);
     {
         // SP task dispatch trace. Useful for tracking task scheduling

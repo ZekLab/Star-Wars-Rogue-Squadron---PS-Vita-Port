@@ -491,7 +491,12 @@ void ultramodern::wait_for_pending_audio_synth() {
 
 void task_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_ready) {
     ultramodern::set_native_thread_name("SP Task Thread");
+#ifdef __vita__
+    // The audio synth (a few ms per task) must not wait behind the gfx thread's long display-list parses on the Vita.
+    ultramodern::set_native_thread_priority(ultramodern::ThreadPriority::High);
+#else
     ultramodern::set_native_thread_priority(ultramodern::ThreadPriority::Normal);
+#endif
 
     // Notify the caller thread that this thread is ready.
     thread_ready->signal();
@@ -936,7 +941,7 @@ void ultramodern::submit_rsp_task(RDRAM_ARG PTR(OSTask) task_) {
     }
 }
 
-void ultramodern::submit_rdp_range(uint32_t lo_phys, uint32_t hi_phys) {
+ULTRAMODERN_OVERRIDABLE void ultramodern::submit_rdp_range(uint32_t lo_phys, uint32_t hi_phys) {
     if (hi_phys > lo_phys) {
         events_context.action_queue.enqueue(RdpRangeAction{ lo_phys, hi_phys });
     }

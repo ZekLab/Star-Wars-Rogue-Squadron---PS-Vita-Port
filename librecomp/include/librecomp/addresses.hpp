@@ -6,10 +6,17 @@
 #include "recomp.h"
 
 namespace recomp {
+#if defined(__vita__)
+    // 32 MB: game RAM + host scratch up to 0x80B20000, PI handles, patch area and the recomp heap from 0x81000000.
+    constexpr size_t mem_size = 32ULL * 1024ULL * 1024ULL;
+    // No address-space reservation on a 32-bit host; there is no guard region past mem_size.
+    constexpr size_t allocation_size = mem_size;
+#else
     // 512GB (kseg0 size)
     constexpr size_t mem_size = 512ULL * 1024ULL * 1024ULL;
     // 4GB (the full address space)
     constexpr size_t allocation_size = 4096ULL * 1024ULL * 1024ULL;
+#endif
     // We need a place in rdram to hold the PI handles, so pick an address in extended rdram
     constexpr int32_t cart_handle = 0x80800000;
     constexpr int32_t drive_handle = (int32_t)(cart_handle + sizeof(OSPiHandle));

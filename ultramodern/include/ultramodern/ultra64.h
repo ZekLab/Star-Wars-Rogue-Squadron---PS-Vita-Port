@@ -11,6 +11,13 @@
 #define ALIGNED(x)
 #endif
 
+// Runtime defaults that src/main redefines; weak on Apple because ld64 has no --allow-multiple-definition.
+#ifdef __APPLE__
+#define ULTRAMODERN_OVERRIDABLE __attribute__((weak))
+#else
+#define ULTRAMODERN_OVERRIDABLE
+#endif
+
 typedef int64_t s64;
 typedef uint64_t u64;
 typedef int32_t s32;

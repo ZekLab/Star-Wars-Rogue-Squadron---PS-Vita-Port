@@ -175,6 +175,47 @@ void ultramodern::set_native_thread_name(const std::string& name) {
 }
 
 void ultramodern::set_native_thread_priority(ThreadPriority pri) {}
+#elif defined(__vita__)
+#include <cstdlib>
+#include <mutex>
+#include <vector>
+#include <psp2/kernel/threadmgr.h>
+
+// Vita threads can't be renamed after creation, so names are kept in a registry the host uses for per-thread CPU stats.
+static std::mutex vita_thread_names_mutex;
+static std::vector<std::pair<int, std::string>> vita_thread_names;
+
+void ultramodern::set_native_thread_name(const std::string& name) {
+    std::lock_guard lock{ vita_thread_names_mutex };
+    vita_thread_names.emplace_back(sceKernelGetThreadId(), name);
+}
+
+std::vector<std::pair<int, std::string>> ultramodern::vita_named_threads() {
+    std::lock_guard lock{ vita_thread_names_mutex };
+    return vita_thread_names;
+}
+
+// Vita user priorities run from 64 (highest) to 191; threads start near 160. With the display-list parser keeping a core busy for
+// tens of milliseconds, equal priorities let it delay the VI, timer, audio and game threads that share its cores.
+// ROGUESQ_VITA_THREAD_PRIORITIES=0 leaves every thread at the default.
+void ultramodern::set_native_thread_priority(ThreadPriority pri) {
+    static const bool enabled = []() {
+        const char* e = std::getenv("ROGUESQ_VITA_THREAD_PRIORITIES");
+        return !(e && (e[0] == '0'));
+    }();
+    if (!enabled) {
+        return;
+    }
+    int priority = 160;
+    switch (pri) {
+        case ThreadPriority::Low: priority = 170; break;
+        case ThreadPriority::Normal: priority = 160; break;
+        case ThreadPriority::High: priority = 150; break;
+        case ThreadPriority::VeryHigh: priority = 140; break;
+        case ThreadPriority::Critical: priority = 130; break;
+    }
+    sceKernelChangeThreadPriority(sceKernelGetThreadId(), priority);
+}
 #endif
 
 [[noreturn]] static void end_deleted_thread(UltraThreadContext* cur_context);
