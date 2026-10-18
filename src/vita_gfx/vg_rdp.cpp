@@ -210,6 +210,22 @@ namespace RT64 {
     template<bool RGBA32 = false, bool TLUT = false, bool REF = false>
     __forceinline void loadWord(uint8_t *TMEM, uint32_t tmemAddress, uint32_t tmemXorMask, const uint8_t *RDRAM, uint32_t textureAddress) {
         const uint32_t offsetMask = TLUT ? 0x1 : 0x7;
+        if constexpr (RGBA32 && !TLUT && !REF) {
+            if (s_fastTmem && ((textureAddress & 3) == 0) && ((tmemAddress & 3) == 0)) {
+                // Bytes 0,1,4,5 (R and G of both texels) go to the lower half and 2,3,6,7 (B and A) to the upper half, each run of 4 contiguous.
+                uint32_t w0, w1;
+                memcpy(&w0, RDRAM + textureAddress, 4);
+                memcpy(&w1, RDRAM + textureAddress + 4, 4);
+                const uint32_t a = __builtin_bswap32(w0);
+                const uint32_t b = __builtin_bswap32(w1);
+                const uint32_t lower = (a & 0xFFFF) | (b << 16);
+                const uint32_t upper = (a >> 16) | (b & 0xFFFF0000);
+                const uint32_t dst = tmemAddress ^ tmemXorMask;
+                memcpy(TMEM + dst, &lower, 4);
+                memcpy(TMEM + (dst | (RDP_TMEM_BYTES >> 1)), &upper, 4);
+                return;
+            }
+        }
         if constexpr (RGBA32) {
             const uint32_t UpperTMEM = (RDP_TMEM_BYTES >> 1);
             TMEM[(tmemAddress + 0) ^ tmemXorMask] = RDRAM[(textureAddress + (0 & offsetMask)) ^ 3];

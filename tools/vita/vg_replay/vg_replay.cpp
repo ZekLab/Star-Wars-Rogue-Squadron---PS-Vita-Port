@@ -58,6 +58,8 @@ int main(int argc, char **argv) {
     }
     const std::string dir = argv[1];
     const int scale = (argc > 3) ? atoi(argv[3]) : 2;
+    // Same terrain subdivision default as the Vita (vita_host.cpp).
+    setenv("ROGUESQ_F5_TERRAIN_SUB", "1", 0);
 
     uint32_t viOrigin = 0;
     int taskCount = 0;
@@ -96,6 +98,8 @@ int main(int argc, char **argv) {
     }
     // VG_REPLAY_DRY=1: parse only, nothing reaches GL (profiling the parser, like the console bench).
     submitter.dryRun = (getenv("VG_REPLAY_DRY") != nullptr);
+    // VG_REPLAY_CHECKSUM=1: prints a hash of the last pass's draws (state, vertices, decoded texels) to compare parser changes.
+    submitter.checksumDraws = (getenv("VG_REPLAY_CHECKSUM") != nullptr);
     vg::Renderer renderer(&submitter);
     RT64::State state(rdram, &renderer);
     RT64::Interpreter interpreter;
@@ -153,6 +157,9 @@ int main(int argc, char **argv) {
         }
 
         g_current_scene = header.currentScene;
+        if ((i == 0) && (pass == repeat - 1)) {
+            submitter.drawChecksum = 0;
+        }
         state.rsp->reset();
         interpreter.loadUCodeGBI(header.ucode, header.ucodeData, true);
         renderer.beginTask(&state);
@@ -190,6 +197,9 @@ int main(int argc, char **argv) {
 
     fprintf(stderr, "replay: %.3f ms per pass (%d passes)\n",
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / repeat, repeat);
+    if (submitter.checksumDraws) {
+        fprintf(stderr, "draw checksum %016llX\n", (unsigned long long)submitter.drawChecksum);
+    }
     for (int i = 0; (profMode == 1) && (i < vg::PROF_COUNT); i++) {
         fprintf(stderr, "  section %-15s %8.3f ms/pass %7.1f calls/pass\n", vg::g_profNames[i],
             vg::profTicksToUs(double(vg::g_profTicks[i])) / repeat / 1000.0, double(vg::g_profCalls[i]) / repeat);

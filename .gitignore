@@ -144,3 +144,6 @@ mods/*/build/
 android/.gradle/
 android/app/.cxx/
 android/local.properties
+
+# Vita bubble icon and LiveArea images: built locally from copyrighted box art (tools/vita/livearea_from_art.py)
+vita/sce_sys/**/*.png

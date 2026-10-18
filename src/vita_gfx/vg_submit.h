@@ -23,6 +23,7 @@
 
 #include "vg_backend_gl.h"
 #include "vg_renderer.h"
+#include "vg_shader.h"
 
 namespace vg {
     class Submitter {
@@ -33,7 +34,7 @@ namespace vg {
         // Initializes the backend (on the render thread when threaded); false when GL init failed.
         bool start();
 
-        // Copies the batch vertices and empties the vector (its capacity is kept).
+        // Takes the batch vertices; the vector comes back empty, recycled from an earlier draw when one is free.
         void draw(const DrawState &s, std::vector<Vertex> &vertices, const uint8_t *TMEM, uint32_t tmemTag);
         // Queues a present; blocks while two presents are already pending so parsing stays at most two frames ahead.
         void present(const ViView &view, std::vector<OverlayItem> overlay = {});
@@ -46,6 +47,9 @@ namespace vg {
         int renderThreadId = -1;
         // Parser bench (vita_bench.cpp): textures are still resolved, but nothing reaches the backend (unthreaded only).
         bool dryRun = false;
+        // vg_replay regression check: every draw's state, vertices and decoded texels folded into one hash.
+        bool checksumDraws = false;
+        uint64_t drawChecksum = 0;
 
     private:
         struct Command {
@@ -68,7 +72,8 @@ namespace vg {
         };
 
         void resolveTexture(const DrawState &s, uint32_t index, const uint8_t *TMEM, uint32_t tmemTag, TextureRef &out);
-        void enqueue(Command &&command);
+        // spare, when given, receives an empty vertex vector for the caller's next batch.
+        void enqueue(Command &&command, std::vector<Vertex> *spare = nullptr);
         void execute(Command &command);
         void threadMain();
         // Logs the render thread's state when the parsing thread has waited too long for it (mutex not held).
@@ -85,11 +90,16 @@ namespace vg {
         std::vector<HashCacheEntry> hashCache;
         uint32_t hashCacheTag = 0xFFFFFFFF;
         uint64_t presentCount = 0;
+        // Texture use of the last combiner seen; consecutive batches mostly share it.
+        ShaderKey lastKey = { 0, 0, 0, 0, 0xFFFFFFFF };
+        bool lastKeyUsesTexture[2] = { false, false };
 
         std::thread thread;
-        // Guards the queue only; waiting is done on the semaphores.
+        // Guards the queue and the free vertex vectors; waiting is done on the semaphores.
         std::mutex mutex;
         std::deque<Command> queue;
+        // Vertex vectors the render thread has drawn, kept with their capacity for later batches.
+        std::vector<std::vector<Vertex>> freeVertexBuffers;
         // One signal per queued command; one extra with an empty queue stops the thread.
         moodycamel::LightweightSemaphore commandsReady{ 0 };
         // Presents the parser may queue ahead of the render thread.

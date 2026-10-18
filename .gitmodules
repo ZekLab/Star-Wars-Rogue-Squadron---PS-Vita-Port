@@ -4,4 +4,5 @@
 	branch = runtime-vita
 [submodule "lib/rt64"]
 	path = lib/rt64
-	url = https://github.com/MikeSemicolonD/rt64.git
+	url = git@github.com:tavasiberiu/Star-Wars-Rogue-Squadron---PS-Vita-Port.git
+	branch = rt64-vita

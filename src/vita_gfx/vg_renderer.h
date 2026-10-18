@@ -68,6 +68,12 @@ namespace vg {
 
         // Vertex store for the current task; the index is the RSP "global index".
         uint32_t addVertex(const Vertex &v);
+        // Appends count vertices for the caller to fill; returns the first one, and its index in first.
+        Vertex *addVertices(uint32_t count, uint32_t &first) {
+            first = uint32_t(vertices.size());
+            vertices.resize(vertices.size() + count);
+            return &vertices[first];
+        }
         Vertex &vertex(uint32_t index) { return vertices[index]; }
         uint32_t vertexCount() const { return uint32_t(vertices.size()); }
 

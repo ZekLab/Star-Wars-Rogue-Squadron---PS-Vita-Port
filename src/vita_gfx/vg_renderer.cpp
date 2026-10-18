@@ -162,9 +162,16 @@ namespace vg {
     void Renderer::addTriangle(uint32_t a, uint32_t b, uint32_t c) {
         const RT64::RSP::TextureState &ts = state->rsp->textureState;
         ensureBatch(DrawKind::Triangles, ts.on != 0, ts.tile, ts.levels);
-        pushScreenVertex(vertices[a], true);
-        pushScreenVertex(vertices[b], true);
-        pushScreenVertex(vertices[c], true);
+        // pushScreenVertex(v, true) for each corner, built in place (a copy through the stack per vertex was measurable on the Vita).
+        const bool zPrim = (batchState.otherModeL & (1U << G_MDSFT_ZSRCSEL)) != 0;
+        const float primDepth = batchState.primDepth;
+        const float sx = clipScaleX, sy = clipScaleY;
+        for (const uint32_t index : { a, b, c }) {
+            const Vertex &v = vertices[index];
+            const float w = v.w;
+            const float z = zPrim ? primDepth : v.z;
+            batchVertices.emplace_back((v.x * sx - 1.0f) * w, (1.0f - v.y * sy) * w, (z * 2.0f - 1.0f) * w, w, v.r, v.g, v.b, v.a, v.s, v.t);
+        }
         statTris++;
     }
 

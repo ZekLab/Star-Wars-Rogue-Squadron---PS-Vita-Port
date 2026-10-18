@@ -45,6 +45,7 @@ target_include_directories(vg_replay PRIVATE
     ${RT64_SRC}/contrib
     ${RT64_SRC}/contrib/hlslpp/include
 )
-target_compile_definitions(vg_replay PRIVATE HLSL_CPU GL_SILENCE_DEPRECATION)
-target_compile_options(vg_replay PRIVATE -fno-strict-aliasing -include stdlib.h -Wno-deprecated-declarations)
+target_compile_definitions(vg_replay PRIVATE HLSL_CPU RT64_VITA_SHIM GL_SILENCE_DEPRECATION)
+# No fused multiply-add: the Vita's VFPv3/NEON has none, so the draw checksum matches the console's float results.
+target_compile_options(vg_replay PRIVATE -fno-strict-aliasing -ffp-contract=off -include stdlib.h -Wno-deprecated-declarations)
 target_link_libraries(vg_replay PRIVATE SDL2::SDL2 OpenGL::GL)

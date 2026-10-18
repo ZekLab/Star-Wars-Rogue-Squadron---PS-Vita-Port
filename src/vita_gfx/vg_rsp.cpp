@@ -21,6 +21,8 @@
 
 namespace RT64 {
     constexpr float DepthRange = 1024.0f;
+    // setVertex writes the task's position arrays as plain floats.
+    static_assert(sizeof(hlslpp::float4) == 16 && sizeof(hlslpp::float3) == 16, "hlslpp scalar vectors are 4 packed floats");
 
     static bool envFlag(const char *name, bool def) {
         const char *e = std::getenv(name);
@@ -253,23 +255,47 @@ namespace RT64 {
         constexpr float Inv255 = 1.0f / 255.0f;
         // Exact: the int32 product is rounded once either way, and the divisor is a power of two.
         constexpr float InvTexDivisor = 1.0f / (65536.0f * 32.0f);
-        for (uint32_t i = dstIndex; i < dstIndex + vtxCount; i++) {
+        // Outputs are written in place: the matrix and viewport stay in registers (-fno-strict-aliasing makes every store a possible alias) and no temporaries go through the stack.
+        const size_t firstOut = posTransformed.size();
+        posTransformed.resize(firstOut + vtxCount);
+        posScreen.resize(firstOut + vtxCount);
+        float *ptOut = reinterpret_cast<float *>(&posTransformed[firstOut]);
+        float *psOut = reinterpret_cast<float *>(&posScreen[firstOut]);
+        uint32_t globalIndex = 0;
+        vg::Vertex *vOut = renderer.addVertices(vtxCount, globalIndex);
+        float m[16];
+        memcpy(m, &mvp, sizeof(m));
+        const float scaleX = viewport.scale.x, scaleY = viewport.scale.y, scaleZ = viewport.scale.z;
+        const float transX = viewport.translate.x, transY = viewport.translate.y, transZ = viewport.translate.z;
+        for (uint32_t i = dstIndex; i < dstIndex + vtxCount; i++, ptOut += 4, psOut += 4, vOut++) {
             const Vertex &v = vertices[i];
-            const hlslpp::float4 tfPos = hlslpp::mul(hlslpp::float4(float(v.x), float(v.y), float(v.z), 1.0f), mvp);
-            float w = float(tfPos.w);
+            // hlslpp's mul(float4(x, y, z, 1), mvp) in the same order: ((row0 * x + row1 * y) + row2 * z) + row3, each step rounded.
+            const float fx = float(v.x), fy = float(v.y), fz = float(v.z);
+            const float tx = ((m[0] * fx + m[4] * fy) + m[8] * fz) + m[12];
+            const float ty = ((m[1] * fx + m[5] * fy) + m[9] * fz) + m[13];
+            const float tz = ((m[2] * fx + m[6] * fy) + m[10] * fz) + m[14];
+            const float tw = ((m[3] * fx + m[7] * fy) + m[11] * fz) + m[15];
+            ptOut[0] = tx;
+            ptOut[1] = ty;
+            ptOut[2] = tz;
+            ptOut[3] = tw;
+            float w = tw;
             if (w == 0.0f) {
                 w = 1e-6f;
             }
 
             const float invW = 1.0f / w;
-            const hlslpp::float3 ps = (tfPos.xyz * hlslpp::float3(invW, -invW, invW)) * viewport.scale + viewport.translate;
-            posTransformed.emplace_back(tfPos);
-            posScreen.emplace_back(ps);
+            const float psx = (tx * invW) * scaleX + transX;
+            const float psy = (ty * -invW) * scaleY + transY;
+            const float psz = (tz * invW) * scaleZ + transZ;
+            psOut[0] = psx;
+            psOut[1] = psy;
+            psOut[2] = psz;
 
-            vg::Vertex out;
-            out.x = float(ps.x);
-            out.y = float(ps.y);
-            out.z = float(ps.z);
+            vg::Vertex &out = *vOut;
+            out.x = psx;
+            out.y = psy;
+            out.z = psz;
             out.w = w;
 
             const hlslpp::float3 norm(v.normal.x * Inv127, v.normal.y * Inv127, v.normal.z * Inv127);
@@ -290,7 +316,7 @@ namespace RT64 {
             }
 
             if (usesFog) {
-                const float fogAlpha = (std::max(float(tfPos.z), 0.0f) * invW) * fog.mul + fog.offset;
+                const float fogAlpha = (std::max(tz, 0.0f) * invW) * fog.mul + fog.offset;
                 out.a = std::clamp(fogAlpha * Inv255, 0.0f, 1.0f);
             }
             else {
@@ -316,7 +342,7 @@ namespace RT64 {
                 out.t = float(int32_t(v.t) * int32_t(textureState.tc)) * InvTexDivisor;
             }
 
-            indices[i] = renderer.addVertex(out);
+            indices[i] = globalIndex++;
             used[i] = false;
         }
     }
@@ -562,14 +588,16 @@ namespace RT64 {
         Workload &workload = state->ext.workloadQueue->workloads[state->ext.workloadQueue->writeCursor];
         vg::Renderer &renderer = *state->renderer;
         const bool usesCulling = !s_nocull && !doubleSided && (geometryMode & cullTestMask);
+        // cross(V, U).z with U = p1 - p0, V = p2 - p0, as hlslpp computes it. Reads the array each call: clipping appends to it.
         auto visible = [&](uint32_t g0, uint32_t g1, uint32_t g2) {
             if (!usesCulling) {
                 return true;
             }
-            const auto &ps = workload.drawData.posScreen;
-            const hlslpp::float3 U = ps[g1] - ps[g0];
-            const hlslpp::float3 V = ps[g2] - ps[g0];
-            return float(hlslpp::cross(V, U).z) >= 0.0f;
+            const float *ps = reinterpret_cast<const float *>(workload.drawData.posScreen.data());
+            const float *p0 = ps + g0 * 4, *p1 = ps + g1 * 4, *p2 = ps + g2 * 4;
+            const float ux = p1[0] - p0[0], uy = p1[1] - p0[1];
+            const float vx = p2[0] - p0[0], vy = p2[1] - p0[1];
+            return (vx * uy - vy * ux) >= 0.0f;
         };
 
         constexpr float kNearW = 1e-4f;
@@ -579,9 +607,10 @@ namespace RT64 {
         bool extreme = false;
         bool anyNear = false;
         if (s_clip && !degenerate) {
+            const float *pt = reinterpret_cast<const float *>(workload.drawData.posTransformed.data());
             for (int i = 0; i < 3; i++) {
-                const hlslpp::float4 p = workload.drawData.posTransformed[globalIndices[i]];
-                const float pw = p.w, px = p.x, py = p.y;
+                const float *p = pt + globalIndices[i] * 4;
+                const float pw = p[3], px = p[0], py = p[1];
                 if (pw <= kNearW) {
                     extreme = true;
                     anyNear = true;
@@ -645,8 +674,8 @@ namespace RT64 {
             return;
         }
 
-        const auto &posTransformed = workload.drawData.posTransformed;
-        const bool nearCrossing = (posTransformed[globalIndices[0]].w <= 0.0f) || (posTransformed[globalIndices[1]].w <= 0.0f) || (posTransformed[globalIndices[2]].w <= 0.0f);
+        const float *pt = reinterpret_cast<const float *>(workload.drawData.posTransformed.data());
+        const bool nearCrossing = (pt[globalIndices[0] * 4 + 3] <= 0.0f) || (pt[globalIndices[1] * 4 + 3] <= 0.0f) || (pt[globalIndices[2] * 4 + 3] <= 0.0f);
         if (!nearCrossing && !visible(globalIndices[0], globalIndices[1], globalIndices[2])) {
             return;
         }

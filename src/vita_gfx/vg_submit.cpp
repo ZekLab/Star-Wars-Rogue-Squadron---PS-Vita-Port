@@ -13,6 +13,9 @@
 
 #include "shared/rt64_f3d_defines.h"
 
+#define XXH_INLINE_ALL
+#include "xxHash/xxhash.h"
+
 #include "vg_prof.h"
 #include "vg_shader.h"
 #include "vg_texture.h"
@@ -26,6 +29,8 @@ namespace vg {
     constexpr size_t EvictedHashesKept = 4096;
     // The parsing thread logs the render thread's state after waiting this long for it.
     constexpr std::int64_t StallLogUs = 2000000;
+    // About two frames of batches; vectors returned beyond this are freed.
+    constexpr size_t FreeVertexBuffersKept = 1024;
     static const char *StageNames[] = { "idle", "draw", "present", "swap", "delete textures" };
 
     Submitter::Submitter(Backend *backend, bool threaded) : backend(backend), threaded(threaded) {
@@ -76,11 +81,18 @@ namespace vg {
         initResult = backend->init();
         initSignal.signal();
 
+        // The last draw's vertices go back to the free list under the same lock that takes the next command.
+        std::vector<Vertex> drawnVertices;
         while (true) {
             commandsReady.wait();
             Command command;
             {
                 std::lock_guard<std::mutex> lock(mutex);
+                if ((drawnVertices.capacity() > 0) && (freeVertexBuffers.size() < FreeVertexBuffersKept)) {
+                    drawnVertices.clear();
+                    freeVertexBuffers.push_back(std::move(drawnVertices));
+                }
+                drawnVertices = std::vector<Vertex>();
                 if (queue.empty()) {
                     return;
                 }
@@ -92,7 +104,10 @@ namespace vg {
             stage = StageIdle;
             executed++;
 
-            if (command.type == Command::Type::Present) {
+            if (command.type == Command::Type::Draw) {
+                drawnVertices = std::move(command.vertices);
+            }
+            else if (command.type == Command::Type::Present) {
                 presentSlots.signal();
             }
             else if (command.type == Command::Type::Fence) {
@@ -114,10 +129,14 @@ namespace vg {
         }
     }
 
-    void Submitter::enqueue(Command &&command) {
+    void Submitter::enqueue(Command &&command, std::vector<Vertex> *spare) {
         if (!threaded) {
             if (!dryRun) {
                 execute(command);
+            }
+            if (spare != nullptr) {
+                command.vertices.clear();
+                spare->swap(command.vertices);
             }
             return;
         }
@@ -131,6 +150,10 @@ namespace vg {
         {
             std::lock_guard<std::mutex> lock(mutex);
             queue.push_back(std::move(command));
+            if ((spare != nullptr) && !freeVertexBuffers.empty()) {
+                spare->swap(freeVertexBuffers.back());
+                freeVertexBuffers.pop_back();
+            }
         }
         commandsReady.signal();
     }
@@ -235,20 +258,36 @@ namespace vg {
         Command command;
         command.type = Command::Type::Draw;
         command.state = s;
-        // Copied, not moved: the caller's vector keeps its capacity, so the next batch does not regrow it from nothing.
-        command.vertices.assign(vertices.begin(), vertices.end());
-        vertices.clear();
+        command.vertices.swap(vertices);
 
         // Draws into the depth image are handled without textures (depth clears) or skipped by the backend.
         if (s.colorImage != s.depthImage) {
             const ShaderKey key = makeShaderKey(s);
+            if (!(key == lastKey)) {
+                lastKey = key;
+                lastKeyUsesTexture[0] = shaderUsesTexture(key, 0);
+                lastKeyUsesTexture[1] = shaderUsesTexture(key, 1);
+            }
             for (uint32_t i = 0; i < 2; i++) {
-                if (shaderUsesTexture(key, i)) {
+                if (lastKeyUsesTexture[i]) {
                     resolveTexture(s, i, TMEM, tmemTag, command.textures[i]);
                 }
             }
         }
-        enqueue(std::move(command));
+        if (checksumDraws) {
+            drawChecksum = XXH3_64bits_withSeed(&s, sizeof(s), drawChecksum);
+            drawChecksum = XXH3_64bits_withSeed(command.vertices.data(), command.vertices.size() * sizeof(Vertex), drawChecksum);
+            for (uint32_t i = 0; i < 2; i++) {
+                const TextureRef &t = command.textures[i];
+                if (t.width == 0) {
+                    continue;
+                }
+                std::vector<uint8_t> texels(size_t(t.width) * t.height * 4);
+                decodeTile(TMEM, s.tiles[i], s.otherModeH & (3U << G_MDSFT_TEXTLUT), t.width, t.height, texels.data());
+                drawChecksum = XXH3_64bits_withSeed(texels.data(), texels.size(), drawChecksum ^ (uint64_t(t.width) << 16) ^ t.height);
+            }
+        }
+        enqueue(std::move(command), &vertices);
     }
 
     void Submitter::present(const ViView &view, std::vector<OverlayItem> overlay) {

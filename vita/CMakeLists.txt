@@ -123,8 +123,11 @@ set_source_files_properties(
     ${RS64_ROOT}/src/vita_gfx/vg_rdp.cpp
     ${RS64_ROOT}/src/vita_gfx/vg_renderer.cpp
     PROPERTIES COMPILE_OPTIONS -fno-threadsafe-statics)
+# SLP packs per-vertex float stores into a stack round trip (4 single stores reloaded as 2 doubles), which stalls the A9's store forwarding.
+set_property(SOURCE ${RS64_ROOT}/src/vita_gfx/vg_rsp.cpp ${RS64_ROOT}/src/vita_gfx/vg_renderer.cpp APPEND PROPERTY COMPILE_OPTIONS -fno-tree-slp-vectorize)
 # RT64's shared/ headers are dual HLSL/C++; HLSL_CPU selects the C++ (hlslpp) side, as in the desktop build.
-target_compile_definitions(vita_gfx PUBLIC HLSL_CPU)
+# RT64_VITA_SHIM selects the Vita fast paths in RT64's Factor 5 parser (the desktop build never defines it).
+target_compile_definitions(vita_gfx PUBLIC HLSL_CPU RT64_VITA_SHIM)
 
 # ---- Game executable ----
 find_package(SDL2 REQUIRED)
@@ -205,7 +208,17 @@ set(VITA_VERSION "00.01")
 set(VITA_MKSFOEX_FLAGS "${VITA_MKSFOEX_FLAGS} -d ATTRIBUTE2=12")
 
 vita_create_self(eboot.bin RogueSquadronVita UNSAFE)
+# Bubble icon and LiveArea are built locally from copyrighted box art (tools/vita/livearea_from_art.py); without them the VPK gets the system defaults.
+set(LIVEAREA_FILES)
+if (EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/sce_sys/icon0.png AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/sce_sys/livearea/contents/bg.png AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/sce_sys/livearea/contents/startup.png)
+    foreach(file icon0.png livearea/contents/bg.png livearea/contents/startup.png livearea/contents/template.xml)
+        list(APPEND LIVEAREA_FILES FILE sce_sys/${file} sce_sys/${file})
+    endforeach()
+else()
+    message(STATUS "No LiveArea images in vita/sce_sys; run tools/vita/livearea_from_art.py to add them")
+endif()
 vita_create_vpk(RogueSquadronVita.vpk ${VITA_TITLEID} eboot.bin
     VERSION ${VITA_VERSION}
     NAME "Rogue Squadron"
+    ${LIVEAREA_FILES}
 )
