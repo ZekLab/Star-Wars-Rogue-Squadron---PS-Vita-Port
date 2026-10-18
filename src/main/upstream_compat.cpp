@@ -445,10 +445,12 @@ extern "C" void osDestroyThread_recomp(uint8_t* rdram, recomp_context* ctx) {
 extern "C" volatile unsigned g_rs64_pw_calls = 0, g_rs64_pw_waited = 0, g_rs64_pw_ms = 0, g_rs64_pw_timeouts = 0;
 extern "C" void rs64_wait_gfx_parse_yield(uint8_t* rdram, recomp_context* ctx) {
     g_rs64_pw_calls = g_rs64_pw_calls + 1;
-    const auto t0 = std::chrono::steady_clock::now();
+    // The clock is read only once a wait has begun: it costs ~5 us on the Vita, and most calls (every heap free) find no parse in flight.
+    std::chrono::steady_clock::time_point t0;
     auto ms_since = [&]() { return (unsigned)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count(); };
     for (int i = 0; i < 500; ++i) {
-        if (!rs64_gfx_parse_inflight_wait(1)) { if (i) { g_rs64_pw_waited = g_rs64_pw_waited + 1; g_rs64_pw_ms = g_rs64_pw_ms + ms_since(); } return; }
+        if (!rs64_gfx_parse_inflight_wait(1)) { if (i) { g_rs64_pw_waited = g_rs64_pw_waited + 1; g_rs64_pw_ms = g_rs64_pw_ms + ms_since() + 1; } return; }
+        if (i == 0) t0 = std::chrono::steady_clock::now();
         osYieldThread_recomp(rdram, ctx);
     }
     g_rs64_pw_timeouts = g_rs64_pw_timeouts + 1; g_rs64_pw_ms = g_rs64_pw_ms + ms_since();

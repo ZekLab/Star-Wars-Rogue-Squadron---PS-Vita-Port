@@ -20,6 +20,10 @@
 
 // PS Vita build: shim of lib/rt64/src/hle/rt64_rsp.h. Same members, so RT64's GBI parsers compile unchanged;
 // the methods are implemented in src/vita_gfx (CPU transform + vitaGL) instead of RT64's GPU workload pipeline.
+namespace vg {
+    struct TriRules;
+}
+
 namespace RT64 {
     struct Projection {
         enum class Type {
@@ -173,6 +177,20 @@ namespace RT64 {
         std::array<Vertex, RSP_MAX_VERTICES> vertices;
         std::array<uint32_t, RSP_MAX_VERTICES> indices;
         std::bitset<RSP_MAX_VERTICES> used;
+        // Matrix and viewport generation each slot was transformed under (0 = none), so a face can reuse its vertices' load-time transform.
+        std::array<uint32_t, RSP_MAX_VERTICES> slotTransformGen;
+        uint32_t transformGen = 1;
+        // Bumped whenever the viewport changes; a batch keeps one copy per generation for the vertices clipping creates.
+        uint32_t viewportGen = 1;
+        // Set by the Factor 5 face path for the next setVertex only: the cache slot each new vertex was copied from.
+        const uint32_t *faceSourceSlots = nullptr;
+        // Vertices processed, and how many of them took a cached transform (statistics, reset by the reporter).
+        uint32_t statVertices = 0, statReusedVertices = 0;
+        void bumpTransformGen() {
+            if (++transformGen == 0) {
+                transformGen = 1;
+            }
+        }
         std::array<Light, RSP_MAX_LIGHTS + 1> lights;
         int lightCount;
         uint32_t vertexFogIndex;
@@ -274,10 +292,8 @@ namespace RT64 {
         template<bool addEmptyVelocity, uint32_t vertexSize>
         void setVertexCommon(uint32_t rdramAddress, uint32_t dstIndex, uint32_t dstMax);
         void modifyVertex(uint16_t dstIndex, uint16_t dstAttribute, uint32_t value);
-        // Appends a vertex lerped in model space between global verts ga and gb at parameter t.
-        // Model-space lerp is exact in clip space (MVP is affine), so the GPU CS re-transform
-        // reproduces the intended near-plane-clipped position. Returns the new global index.
-        uint32_t appendClippedVertex(uint32_t ga, uint32_t gb, float t);
+        // The cull and clip rules drawIndexedTri hands to the resolve stage with each batch (vg_renderer.cpp).
+        vg::TriRules triRules() const;
         void setGeometryMode(uint32_t mask);
         void pushGeometryMode();
         void popGeometryMode();

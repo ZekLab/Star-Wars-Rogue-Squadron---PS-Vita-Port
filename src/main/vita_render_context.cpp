@@ -54,6 +54,9 @@ namespace rs64::video {
 extern "C" std::atomic<unsigned> g_rs64_swap_count;  // upstream_compat.cpp
 extern "C" uint8_t* g_rs64_parse_rdram;
 extern "C" volatile long long g_rs64_snap_us;
+// Game-side counters (upstream_compat.cpp, ultramodern timer.cpp) for the per-window report.
+extern "C" volatile unsigned g_rs64_pw_calls, g_rs64_pw_waited, g_rs64_pw_ms;
+extern "C" volatile uint32_t g_rs64_osgetcount_calls, g_rs64_osgettime_calls;
 
 #ifdef __vita__
 #include "vita_host.h"
@@ -82,8 +85,9 @@ namespace {
             if (vg::g_profEnabled) {
                 vg::profInit();
             }
-            // ROGUESQ_VG_RENDER_THREAD=0 runs the GL backend inline on the gfx thread.
-            submitter = std::make_unique<vg::Submitter>(&backend, recomp::dbg::env_on("ROGUESQ_VG_RENDER_THREAD", true));
+            // ROGUESQ_VG_RENDER_THREAD=0 runs the GL backend inline on the gfx thread; ROGUESQ_VG_RESOLVE_THREAD=0 does the same for texture loads and hashing.
+            submitter = std::make_unique<vg::Submitter>(&backend, recomp::dbg::env_on("ROGUESQ_VG_RENDER_THREAD", true),
+                recomp::dbg::env_on("ROGUESQ_VG_RESOLVE_THREAD", true));
             if (render_enabled && !submitter->start()) {
                 render_enabled = false;
             }
@@ -185,10 +189,22 @@ namespace {
                 tasks_window / secs, vi_window / secs, vg::Backend::freeVramKB(), rs64_state_current_id());
             if (render_enabled) {
                 const double tasks = std::max(1u, tasks_window);
-                fprintf(stderr, "[vita-gfx] per task: parse+submit %.2f ms, tris %.0f, rects %.0f, batches %.0f | texture hashes +%u, decodes +%u (again +%u), uploads +%u, shaders compiled +%u cached +%u, skipped %u | snapshot copy %.2f ms, heap in use %u KB\n",
-                    dl_us_window / tasks / 1000.0, renderer->statTris / tasks, renderer->statRects / tasks, renderer->statBatches / tasks,
-                    submitter->statHashes, submitter->statDecodes, submitter->statRedecodes, backend.statTexUploads, backend.statShaderCompiles, backend.statShaderCacheHits, backend.statSkipped,
+                fprintf(stderr, "[vita-gfx] per task: parse+submit %.2f ms (resolve wait %.2f, resolve busy %.2f), tris %.0f, rects %.0f, batches %.0f | texture hashes +%u, decodes +%u (again +%u), uploads +%u, shaders compiled +%u cached +%u, skipped %u | snapshot copy %.2f ms, heap in use %u KB\n",
+                    dl_us_window / tasks / 1000.0, submitter->statTaskWaitUs.load() / tasks / 1000.0, submitter->statResolveUs.load() / tasks / 1000.0,
+                    submitter->statTris.load() / tasks, renderer->statRects / tasks, submitter->statBatches.load() / tasks,
+                    submitter->statHashes.load(), submitter->statDecodes.load(), submitter->statRedecodes.load(), backend.statTexUploads, backend.statShaderCompiles, backend.statShaderCacheHits, backend.statSkipped,
                     g_rs64_snap_us / 1000.0, unsigned(mallinfo().uordblks / 1024));
+                const unsigned pwCalls = g_rs64_pw_calls, pwWaited = g_rs64_pw_waited, pwMs = g_rs64_pw_ms;
+                const uint32_t getCount = g_rs64_osgetcount_calls, getTime = g_rs64_osgettime_calls;
+                fprintf(stderr, "[vita-game] per task: vertices %.0f (transform reused %.0f) | parse-wait hooks %.1f, waited %.1f for %.2f ms | osGetCount %.1f, osGetTime %.1f\n",
+                    state->rsp->statVertices / tasks, state->rsp->statReusedVertices / tasks, (pwCalls - pw_calls_prev) / tasks, (pwWaited - pw_waited_prev) / tasks,
+                    (pwMs - pw_ms_prev) / tasks, (getCount - getcount_prev) / tasks, (getTime - gettime_prev) / tasks);
+                pw_calls_prev = pwCalls;
+                pw_waited_prev = pwWaited;
+                pw_ms_prev = pwMs;
+                getcount_prev = getCount;
+                gettime_prev = getTime;
+                state->rsp->statVertices = state->rsp->statReusedVertices = 0;
                 if (vg::g_profEnabled) {
                     std::string line = "[vita-gfx] per task ms:";
                     for (int i = 0; i < vg::PROF_COUNT; i++) {
@@ -205,8 +221,10 @@ namespace {
             tasks_window = 0;
             vi_window = 0;
             dl_us_window = 0;
-            renderer->statTris = renderer->statRects = renderer->statBatches = 0;
+            renderer->statRects = 0;
+            submitter->statTris = submitter->statBatches = 0;
             submitter->statHashes = submitter->statDecodes = submitter->statRedecodes = 0;
+            submitter->statTaskWaitUs = submitter->statResolveUs = 0;
             backend.statShaderCompiles = backend.statShaderCacheHits = backend.statTexUploads = backend.statSkipped = backend.statDraws = backend.statPresents = 0;
             backend.statStalePresents = backend.statLowPresents = 0;
             window_start = now;
@@ -221,6 +239,9 @@ namespace {
             auto threads = ultramodern::vita_named_threads();
             if (submitter->renderThreadId >= 0) {
                 threads.emplace_back(submitter->renderThreadId, "Render Thread");
+            }
+            if (const int resolveId = submitter->resolveThreadId.load(); resolveId >= 0) {
+                threads.emplace_back(resolveId, "Resolve Thread");
             }
             for (const auto& [uid, name] : threads) {
                 SceKernelThreadInfo info{};
@@ -247,6 +268,8 @@ namespace {
         }
 
         std::unordered_map<int, unsigned long long> last_run;
+        unsigned pw_calls_prev = 0, pw_waited_prev = 0, pw_ms_prev = 0;
+        uint32_t getcount_prev = 0, gettime_prev = 0;
         uint32_t last_vi_mode[6] = {};
         unsigned swaps_prev = 0;
         uint8_t* rdram;

@@ -92,12 +92,14 @@ int main(int argc, char **argv) {
     backend.resScale = scale;
     backend.screenWidth = 960;
     backend.screenHeight = 720;
-    vg::Submitter submitter(&backend, false);
+    // VG_REPLAY_DRY=1: parse only, nothing reaches GL (profiling the parser, like the console bench).
+    const bool dry = (getenv("VG_REPLAY_DRY") != nullptr);
+    // VG_REPLAY_RESOLVE_THREAD=1 (with DRY): texture loads and hashing on their own thread, as on the Vita.
+    vg::Submitter submitter(&backend, false, dry && (getenv("VG_REPLAY_RESOLVE_THREAD") != nullptr));
     if (!submitter.start()) {
         return 1;
     }
-    // VG_REPLAY_DRY=1: parse only, nothing reaches GL (profiling the parser, like the console bench).
-    submitter.dryRun = (getenv("VG_REPLAY_DRY") != nullptr);
+    submitter.dryRun = dry;
     // VG_REPLAY_CHECKSUM=1: prints a hash of the last pass's draws (state, vertices, decoded texels) to compare parser changes.
     submitter.checksumDraws = (getenv("VG_REPLAY_CHECKSUM") != nullptr);
     vg::Renderer renderer(&submitter);
@@ -115,6 +117,13 @@ int main(int argc, char **argv) {
     vg::g_profEnabled = (profMode == 1);
     vg::g_opProfEnabled = (profMode == 2);
     const auto t0 = std::chrono::steady_clock::now();
+    // CPU time of this (the parsing) thread: with the resolve thread on, wall time also counts waiting for it.
+    auto threadCpuMs = []() {
+        timespec ts;
+        clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+        return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
+    };
+    const double cpu0 = threadCpuMs();
     std::vector<VgCaptureHeader> headers(taskCount);
     std::vector<std::vector<uint8_t>> snapshots(taskCount);
     for (int i = 0; i < taskCount; i++) {
@@ -186,17 +195,19 @@ int main(int argc, char **argv) {
             fprintf(stderr, "  total %zu KB\n", total * g_pageSize / 1024);
         }
         if (pass == repeat - 1) {
-            fprintf(stderr, "task %d: dl 0x%06X tris %u rects %u batches %u draws %u skipped %u shaders %u textures %u hashes %u (last pass)\n", i, header.dataPtr,
-                renderer.statTris, renderer.statRects, renderer.statBatches, backend.statDraws, backend.statSkipped, backend.statShaderCompiles, backend.statTexUploads,
-                submitter.statHashes);
+            fprintf(stderr, "task %d: dl 0x%06X tris %u rects %u batches %u draws %u skipped %u shaders %u textures %u hashes %u vertices %u (transform reused %u) (last pass)\n", i, header.dataPtr,
+                submitter.statTris.load(), renderer.statRects, submitter.statBatches.load(), backend.statDraws, backend.statSkipped, backend.statShaderCompiles, backend.statTexUploads,
+                submitter.statHashes.load(), state.rsp->statVertices, state.rsp->statReusedVertices);
         }
         submitter.statHashes = submitter.statDecodes = 0;
-        renderer.statTris = renderer.statRects = renderer.statBatches = 0;
+        state.rsp->statVertices = state.rsp->statReusedVertices = 0;
+        renderer.statRects = 0;
+        submitter.statTris = submitter.statBatches = 0;
         backend.statDraws = backend.statSkipped = backend.statShaderCompiles = backend.statTexUploads = 0;
     }
 
-    fprintf(stderr, "replay: %.3f ms per pass (%d passes)\n",
-        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / repeat, repeat);
+    fprintf(stderr, "replay: %.3f ms per pass (%d passes), parsing thread cpu %.3f ms per pass\n",
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / repeat, repeat, (threadCpuMs() - cpu0) / repeat);
     if (submitter.checksumDraws) {
         fprintf(stderr, "draw checksum %016llX\n", (unsigned long long)submitter.drawChecksum);
     }

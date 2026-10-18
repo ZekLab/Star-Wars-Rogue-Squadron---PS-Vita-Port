@@ -111,6 +111,10 @@ namespace rs64::vita {
         vg::Backend backend;
         vg::Submitter submitter(&backend, false);
         submitter.dryRun = true;
+        // The game's configuration: texture loads and hashing on a resolve thread, here on the core next to this one.
+        vg::Submitter threadedSubmitter(&backend, false, true);
+        threadedSubmitter.dryRun = true;
+        threadedSubmitter.resolveCore = 1;
         vg::Renderer renderer(&submitter);
         RT64::State state(rdram.data(), &renderer);
         RT64::Interpreter interpreter;
@@ -118,7 +122,9 @@ namespace rs64::vita {
 
         PassStats stats;
         auto runPass = [&](bool restore) {
-            renderer.statTris = renderer.statRects = renderer.statBatches = 0;
+            vg::Submitter &submitter = *renderer.submitter;
+            renderer.statRects = 0;
+            submitter.statTris = submitter.statBatches = 0;
             submitter.statHashes = submitter.statDecodes = 0;
             for (int i = 0; i < taskCount; i++) {
                 const VgCaptureHeader &header = headers[i];
@@ -132,11 +138,11 @@ namespace rs64::vita {
                 interpreter.processDisplayLists(header.dataPtr, reinterpret_cast<RT64::DisplayList *>(rdram.data() + header.dataPtr));
                 renderer.endTask();
             }
-            stats.tris = renderer.statTris;
+            stats.tris = submitter.statTris.load();
             stats.rects = renderer.statRects;
-            stats.batches = renderer.statBatches;
-            stats.hashes = submitter.statHashes;
-            stats.decodes = submitter.statDecodes;
+            stats.batches = submitter.statBatches.load();
+            stats.hashes = submitter.statHashes.load();
+            stats.decodes = submitter.statDecodes.load();
             stats.vertices = renderer.vertexCount();
         };
 
@@ -193,6 +199,15 @@ namespace rs64::vita {
         timeMode("no timers");
         fprintf(stderr, "[vg-bench] texture hash input: %.0f bytes/pass in %.0f updates/pass\n",
             double(vg::g_hashBytes) / passes, double(vg::g_hashUpdates) / passes);
+
+        renderer.submitter = &threadedSubmitter;
+        runPass(false);
+        runPass(false);
+        threadedSubmitter.statTaskWaitUs = threadedSubmitter.statResolveUs = 0;
+        timeMode("no timers, resolve thread");
+        fprintf(stderr, "[vg-bench] resolve thread: %.2f ms/pass busy, parser waited %.2f ms/pass at task end\n",
+            threadedSubmitter.statResolveUs.load() / 1000.0 / passes, threadedSubmitter.statTaskWaitUs.load() / 1000.0 / passes);
+        renderer.submitter = &submitter;
 
         vg::profReset();
         vg::g_profEnabled = true;

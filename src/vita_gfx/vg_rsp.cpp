@@ -62,6 +62,10 @@ namespace RT64 {
         vertices.fill({});
         indices.fill(0);
         used.reset();
+        slotTransformGen.fill(0);
+        bumpTransformGen();
+        viewportGen++;
+        faceSourceSlots = nullptr;
         lights.fill({});
         segments.fill(0);
         viewportStack[0] = {};
@@ -179,6 +183,7 @@ namespace RT64 {
         modelViewProjMatrix = fixedMatrix->toMatrix4x4();
         modelViewProjInserted = true;
         modelViewProjChanged = false;
+        bumpTransformGen();
     }
 
     void RSP::computeModelViewProj() {
@@ -186,6 +191,7 @@ namespace RT64 {
         modelViewProjMatrix = hlslpp::mul(modelMatrixStack[modelMatrixStackSize - 1], viewProjMatrix);
         modelViewProjInserted = false;
         modelViewProjChanged = false;
+        bumpTransformGen();
     }
 
     // Per-vertex processing (RSPProcessCS.hlsl on the CPU). Matrices use the row-vector convention of the CPU side
@@ -196,6 +202,8 @@ namespace RT64 {
     }
 
     void RSP::setVertex(uint32_t address, uint32_t vtxCount, uint32_t dstIndex) {
+        const uint32_t *sourceSlots = faceSourceSlots;
+        faceSourceSlots = nullptr;
         if ((dstIndex >= RSP_MAX_VERTICES) || ((dstIndex + vtxCount) > RSP_MAX_VERTICES)) {
             return;
         }
@@ -256,6 +264,7 @@ namespace RT64 {
         // Exact: the int32 product is rounded once either way, and the divisor is a power of two.
         constexpr float InvTexDivisor = 1.0f / (65536.0f * 32.0f);
         // Outputs are written in place: the matrix and viewport stay in registers (-fno-strict-aliasing makes every store a possible alias) and no temporaries go through the stack.
+        renderer.reserveVertices(vtxCount);
         const size_t firstOut = posTransformed.size();
         posTransformed.resize(firstOut + vtxCount);
         posScreen.resize(firstOut + vtxCount);
@@ -267,27 +276,49 @@ namespace RT64 {
         memcpy(m, &mvp, sizeof(m));
         const float scaleX = viewport.scale.x, scaleY = viewport.scale.y, scaleZ = viewport.scale.z;
         const float transX = viewport.translate.x, transY = viewport.translate.y, transZ = viewport.translate.z;
+        // A face copies its vertices from cache slots a load transformed moments ago; under the same matrix and viewport their positions
+        // are taken from there (same inputs, same results), and only color, alpha and texcoords are worked out again.
+        statVertices += vtxCount;
         for (uint32_t i = dstIndex; i < dstIndex + vtxCount; i++, ptOut += 4, psOut += 4, vOut++) {
             const Vertex &v = vertices[i];
-            // hlslpp's mul(float4(x, y, z, 1), mvp) in the same order: ((row0 * x + row1 * y) + row2 * z) + row3, each step rounded.
-            const float fx = float(v.x), fy = float(v.y), fz = float(v.z);
-            const float tx = ((m[0] * fx + m[4] * fy) + m[8] * fz) + m[12];
-            const float ty = ((m[1] * fx + m[5] * fy) + m[9] * fz) + m[13];
-            const float tz = ((m[2] * fx + m[6] * fy) + m[10] * fz) + m[14];
-            const float tw = ((m[3] * fx + m[7] * fy) + m[11] * fz) + m[15];
+            float tx, ty, tz, tw, w, invW, psx, psy, psz;
+            const uint32_t src = (sourceSlots != nullptr) ? sourceSlots[i - dstIndex] : RSP_MAX_VERTICES;
+            if ((src < dstIndex) && (slotTransformGen[src] == transformGen) && (vertices[src].x == v.x) && (vertices[src].y == v.y) && (vertices[src].z == v.z)) {
+                const uint32_t g = indices[src];
+                const float *pt = reinterpret_cast<const float *>(&posTransformed[g]);
+                const float *ps = reinterpret_cast<const float *>(&posScreen[g]);
+                tx = pt[0];
+                ty = pt[1];
+                tz = pt[2];
+                tw = pt[3];
+                psx = ps[0];
+                psy = ps[1];
+                psz = ps[2];
+                w = renderer.vertex(g).w;
+                invW = usesFog ? (1.0f / w) : 0.0f;
+                statReusedVertices++;
+            }
+            else {
+                // hlslpp's mul(float4(x, y, z, 1), mvp) in the same order: ((row0 * x + row1 * y) + row2 * z) + row3, each step rounded.
+                const float fx = float(v.x), fy = float(v.y), fz = float(v.z);
+                tx = ((m[0] * fx + m[4] * fy) + m[8] * fz) + m[12];
+                ty = ((m[1] * fx + m[5] * fy) + m[9] * fz) + m[13];
+                tz = ((m[2] * fx + m[6] * fy) + m[10] * fz) + m[14];
+                tw = ((m[3] * fx + m[7] * fy) + m[11] * fz) + m[15];
+                w = tw;
+                if (w == 0.0f) {
+                    w = 1e-6f;
+                }
+
+                invW = 1.0f / w;
+                psx = (tx * invW) * scaleX + transX;
+                psy = (ty * -invW) * scaleY + transY;
+                psz = (tz * invW) * scaleZ + transZ;
+            }
             ptOut[0] = tx;
             ptOut[1] = ty;
             ptOut[2] = tz;
             ptOut[3] = tw;
-            float w = tw;
-            if (w == 0.0f) {
-                w = 1e-6f;
-            }
-
-            const float invW = 1.0f / w;
-            const float psx = (tx * invW) * scaleX + transX;
-            const float psy = (ty * -invW) * scaleY + transY;
-            const float psz = (tz * invW) * scaleZ + transZ;
             psOut[0] = psx;
             psOut[1] = psy;
             psOut[2] = psz;
@@ -344,47 +375,16 @@ namespace RT64 {
 
             indices[i] = globalIndex++;
             used[i] = false;
+            slotTransformGen[i] = transformGen;
         }
-    }
-
-    // Clip-space lerp between two processed vertices (matches RT64's appendClippedVertex).
-    uint32_t RSP::appendClippedVertex(uint32_t ga, uint32_t gb, float t) {
-        Workload &workload = state->ext.workloadQueue->workloads[state->ext.workloadQueue->writeCursor];
-        auto &posTransformed = workload.drawData.posTransformed;
-        auto &posScreen = workload.drawData.posScreen;
-        vg::Renderer &renderer = *state->renderer;
-        const hlslpp::float4 pt = posTransformed[ga] + (posTransformed[gb] - posTransformed[ga]) * t;
-        float w = float(pt.w);
-        if (w == 0.0f) {
-            w = 1e-6f;
-        }
-
-        const interop::RSPViewport &viewport = viewportStack[viewportStackSize - 1];
-        const hlslpp::float3 ps = (pt.xyz / hlslpp::float3(w, -w, w)) * viewport.scale + viewport.translate;
-        posTransformed.emplace_back(pt);
-        posScreen.emplace_back(ps);
-
-        const vg::Vertex a = renderer.vertex(ga);
-        const vg::Vertex b = renderer.vertex(gb);
-        auto lf = [t](float x, float y) { return x + (y - x) * t; };
-        vg::Vertex out;
-        out.x = float(ps.x);
-        out.y = float(ps.y);
-        out.z = float(ps.z);
-        out.w = w;
-        out.r = lf(a.r, b.r);
-        out.g = lf(a.g, b.g);
-        out.b = lf(a.b, b.b);
-        out.a = lf(a.a, b.a);
-        out.s = lf(a.s, b.s);
-        out.t = lf(a.t, b.t);
-        return renderer.addVertex(out);
     }
 
     void RSP::modifyVertex(uint16_t dstIndex, uint16_t dstAttribute, uint32_t value) {
         if (dstIndex >= RSP_MAX_VERTICES) {
             return;
         }
+
+        slotTransformGen[dstIndex] = 0;
 
         vg::Renderer &renderer = *state->renderer;
         Workload &workload = state->ext.workloadQueue->workloads[state->ext.workloadQueue->writeCursor];
@@ -393,6 +393,7 @@ namespace RT64 {
         uint32_t globalIndex = indices[dstIndex];
         if (used[dstIndex]) {
             // Already drawn this task: modify a copy so earlier triangles keep the old values.
+            renderer.reserveVertices(1);
             posTransformed.emplace_back(posTransformed[globalIndex]);
             posScreen.emplace_back(posScreen[globalIndex]);
             const vg::Vertex copy = renderer.vertex(globalIndex);
@@ -454,6 +455,8 @@ namespace RT64 {
         viewport.scale.x = float(vp->vscale[1]) / 4.0f;
         viewport.scale.y = float(vp->vscale[0]) / 4.0f;
         viewport.scale.z = float(vp->vscale[3]) / DepthRange;
+        bumpTransformGen();
+        viewportGen++;
         viewport.translate.x = float(vp->vtrans[1] + extended.global.viewportOffsetX) / 4.0f;
         viewport.translate.y = float(vp->vtrans[0] + extended.global.viewportOffsetY) / 4.0f;
         viewport.translate.z = float(vp->vtrans[3]) / DepthRange;
@@ -556,131 +559,45 @@ namespace RT64 {
         state->rdp->setTextureImage(fmt, siz, width, fromSegmented(segAddress));
     }
 
-    // Culling and frustum clipping as in RT64's drawIndexedTri (Factor 5 cull semantics, guard-band clip, dome rules).
+    // RT64's drawIndexedTri with Factor 5 cull semantics, a guard-band clip and the dome rules. The parser only records the triangle;
+    // culling and clipping run on the resolve stage (vg::buildBatchVertices), with the rules from triRules().
     void RSP::drawIndexedTri(uint32_t a, uint32_t b, uint32_t c, bool rawGlobalIndices) {
         vg::ProfScope prof(vg::PROF_DRAW_TRI);
         const uint32_t geometryMode = geometryModeStack[geometryModeStackSize - 1];
         static const bool s_cullbothdraw = envFlag("ROGUESQ_F5_CULLBOTH_DRAW", true);
-        const bool doubleSided = !f5Cull && s_cullbothdraw && (geometryMode & cullBothMask) == cullBothMask;
         if (!f5Cull && !s_cullbothdraw && (geometryMode & cullBothMask) == cullBothMask) {
             return;
         }
 
-        const uint32_t cullTestMask = f5Cull ? (cullBothMask & ~cullFrontMask) : cullBothMask;
-        static const bool s_nocull = envFlag("ROGUESQ_SKY_NOCULL", false);
         if (!f5Cull && (geometryMode & cullBothMask) == cullFrontMask) {
             std::swap(a, c);
         }
 
-        uint32_t globalIndices[3];
         if (rawGlobalIndices) {
-            globalIndices[0] = a;
-            globalIndices[1] = b;
-            globalIndices[2] = c;
-        }
-        else {
-            globalIndices[0] = indices[a];
-            globalIndices[1] = indices[b];
-            globalIndices[2] = indices[c];
-            used[a] = used[b] = used[c] = true;
+            state->renderer->recordTriangle(a, b, c);
+            return;
         }
 
-        Workload &workload = state->ext.workloadQueue->workloads[state->ext.workloadQueue->writeCursor];
-        vg::Renderer &renderer = *state->renderer;
-        const bool usesCulling = !s_nocull && !doubleSided && (geometryMode & cullTestMask);
-        // cross(V, U).z with U = p1 - p0, V = p2 - p0, as hlslpp computes it. Reads the array each call: clipping appends to it.
-        auto visible = [&](uint32_t g0, uint32_t g1, uint32_t g2) {
-            if (!usesCulling) {
-                return true;
-            }
-            const float *ps = reinterpret_cast<const float *>(workload.drawData.posScreen.data());
-            const float *p0 = ps + g0 * 4, *p1 = ps + g1 * 4, *p2 = ps + g2 * 4;
-            const float ux = p1[0] - p0[0], uy = p1[1] - p0[1];
-            const float vx = p2[0] - p0[0], vy = p2[1] - p0[1];
-            return (vx * uy - vy * ux) >= 0.0f;
-        };
+        used[a] = used[b] = used[c] = true;
+        state->renderer->recordTriangle(indices[a], indices[b], indices[c]);
+    }
 
-        constexpr float kNearW = 1e-4f;
-        constexpr float kGuard = 2.0f;
-        const bool degenerate = (globalIndices[0] == globalIndices[1]) || (globalIndices[1] == globalIndices[2]) || (globalIndices[0] == globalIndices[2]);
+    vg::TriRules RSP::triRules() const {
+        static const bool s_cullbothdraw = envFlag("ROGUESQ_F5_CULLBOTH_DRAW", true);
+        static const bool s_nocull = envFlag("ROGUESQ_SKY_NOCULL", false);
         static const bool s_clip = !envFlag("ROGUESQ_F5_NO_NEAR_CLIP", false);
-        bool extreme = false;
-        bool anyNear = false;
-        if (s_clip && !degenerate) {
-            const float *pt = reinterpret_cast<const float *>(workload.drawData.posTransformed.data());
-            for (int i = 0; i < 3; i++) {
-                const float *p = pt + globalIndices[i] * 4;
-                const float pw = p[3], px = p[0], py = p[1];
-                if (pw <= kNearW) {
-                    extreme = true;
-                    anyNear = true;
-                    break;
-                }
-                if (std::fabs(px) > kGuard * pw || std::fabs(py) > kGuard * pw) {
-                    extreme = true;
-                    break;
-                }
-            }
-        }
-
         static const bool s_pinAll = envFlag("ROGUESQ_F5_SKY_PIN_ALL", false);
-        const bool isDomeTri = cullBothMask != 0 && (geometryMode & cullBothMask) == cullBothMask &&
-                               (s_pinAll || (state->rdp->otherMode.L & G_ZS_PRIM) != 0);
         static const bool s_domeNearDrop = envFlag("ROGUESQ_F5_DOME_NEAR_DROP", true);
-        if (anyNear && isDomeTri && s_domeNearDrop) {
-            return;
-        }
-
-        if (extreme) {
-            auto planeDist = [](const hlslpp::float4 &p, int plane) -> float {
-                const float x = p.x, y = p.y, w = p.w;
-                switch (plane) {
-                    case 0:  return w - kNearW;
-                    case 1:  return kGuard * w + x;
-                    case 2:  return kGuard * w - x;
-                    case 3:  return kGuard * w + y;
-                    default: return kGuard * w - y;
-                }
-            };
-
-            uint32_t poly[10] = { globalIndices[0], globalIndices[1], globalIndices[2] };
-            int polyN = 3;
-            for (int pl = 0; pl < 5 && polyN > 0; pl++) {
-                uint32_t out[10];
-                int outCnt = 0;
-                for (int i = 0; i < polyN; i++) {
-                    const uint32_t gA = poly[i];
-                    const uint32_t gB = poly[(i + 1) % polyN];
-                    const float dA = planeDist(workload.drawData.posTransformed[gA], pl);
-                    const float dB = planeDist(workload.drawData.posTransformed[gB], pl);
-                    const bool inA = dA >= 0.0f;
-                    const bool inB = dB >= 0.0f;
-                    if (inA && outCnt < 10) {
-                        out[outCnt++] = gA;
-                    }
-                    if ((inA != inB) && outCnt < 10) {
-                        out[outCnt++] = appendClippedVertex(gA, gB, dA / (dA - dB));
-                    }
-                }
-                polyN = outCnt;
-                std::copy(out, out + polyN, poly);
-            }
-
-            for (int f = 1; f + 1 < polyN; f++) {
-                if (visible(poly[0], poly[f], poly[f + 1])) {
-                    renderer.addTriangle(poly[0], poly[f], poly[f + 1]);
-                }
-            }
-            return;
-        }
-
-        const float *pt = reinterpret_cast<const float *>(workload.drawData.posTransformed.data());
-        const bool nearCrossing = (pt[globalIndices[0] * 4 + 3] <= 0.0f) || (pt[globalIndices[1] * 4 + 3] <= 0.0f) || (pt[globalIndices[2] * 4 + 3] <= 0.0f);
-        if (!nearCrossing && !visible(globalIndices[0], globalIndices[1], globalIndices[2])) {
-            return;
-        }
-
-        renderer.addTriangle(globalIndices[0], globalIndices[1], globalIndices[2]);
+        vg::TriRules r;
+        r.cullBothMask = cullBothMask;
+        r.cullFrontMask = cullFrontMask;
+        r.f5Cull = f5Cull;
+        r.cullBothDraw = s_cullbothdraw;
+        r.noCull = s_nocull;
+        r.clip = s_clip;
+        r.pinAll = s_pinAll;
+        r.domeNearDrop = s_domeNearDrop;
+        return r;
     }
 
     void RSP::drawIndexedTri(uint32_t a, uint32_t b, uint32_t c) {

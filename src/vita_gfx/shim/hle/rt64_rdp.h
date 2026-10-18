@@ -71,11 +71,8 @@ namespace RT64 {
             None
         };
 
+        // Only the F5 diagnostics load into this copy; draws sample the submitter's TMEM (vg_submit.h).
         uint64_t TMEM[RDP_TMEM_WORDS] = {};
-
-        // Id of the load that last wrote each TMEM word; texture hashing skips words older than the tile's own load.
-        uint32_t tmemWordTags[RDP_TMEM_WORDS] = {};
-        uint32_t tmemLoadTag = 0;
         LoadTexture texture = {};
         LoadTile tiles[RDP_TILES] = {};
         uint64_t tileReplacementHashes[RDP_TILES] = {};

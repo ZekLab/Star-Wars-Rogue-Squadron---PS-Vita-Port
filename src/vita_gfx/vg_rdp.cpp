@@ -1,6 +1,6 @@
 // RDP side of the Vita renderer: RT64's RDP (lib/rt64/src/hle/rt64_rdp.cpp) without the framebuffer manager.
-// Texture loads are applied to TMEM immediately (RT64 defers them to the GPU); the open batch is flushed first so it
-// samples the TMEM contents it was recorded with.
+// Texture loads go to the submitter, which applies them to its TMEM in order with the draws; the open batch is flushed
+// first so it samples the TMEM contents it was recorded with.
 
 #include <algorithm>
 #include <cassert>
@@ -200,7 +200,7 @@ namespace RT64 {
         return !(v && (v[0] == '0'));
     }();
 
-    // ROGUESQ_VG_TMEM_VERIFY=1: every load is repeated with RT64's byte loop on a copy of TMEM and its tags, and differences are logged.
+    // ROGUESQ_VG_TMEM_VERIFY=1: every load is repeated with RT64's byte loop on a copy of TMEM, and differences are logged.
     static const bool s_verifyTmem = []() {
         const char *v = std::getenv("ROGUESQ_VG_TMEM_VERIFY");
         return v && (v[0] == '1');
@@ -264,7 +264,7 @@ namespace RT64 {
     // Verbatim from RT64 except that RDRAM addresses are masked to 24 bits (the Vita RDRAM block is 32 MB).
     template<bool RGBA32 = false, bool BLOCK = false, bool TLUT = false, bool REF = false>
     __forceinline void loadToTMEMCommon(uint8_t *TMEM, const uint8_t *RDRAM, uint32_t textureStart, uint32_t textureStride, uint32_t tmemStart,
-        uint32_t tmemStride, uint32_t wordsPerRow, uint32_t rowCount, uint32_t dxtIncrement, uint32_t *wordTags, uint32_t tag)
+        uint32_t tmemStride, uint32_t wordsPerRow, uint32_t rowCount, uint32_t dxtIncrement)
     {
         const uint32_t DXTSwap = 0x800;
         const uint32_t tmemMask = RGBA32 ? RDP_TMEM_MASK16 : RDP_TMEM_MASK8;
@@ -311,10 +311,6 @@ namespace RT64 {
             wordCount = wordsPerRow;
             while (wordCount > 0) {
                 loadWord<RGBA32, TLUT, REF>(TMEM, tmemAddress, tmemXorMask, RDRAM, textureAddress & RDP_ADDRESS_MASK);
-                wordTags[((tmemAddress ^ tmemXorMask) & RDP_TMEM_MASK8) >> 3] = tag;
-                if constexpr (RGBA32) {
-                    wordTags[(((tmemAddress ^ tmemXorMask) | (RDP_TMEM_BYTES >> 1)) & RDP_TMEM_MASK8) >> 3] = tag;
-                }
                 loadWordStep();
                 wordCount--;
             }
@@ -324,9 +320,9 @@ namespace RT64 {
     }
 
     // Non-RGBA32 load block: between DXT row steps the words land back to back in TMEM under one XOR, so each run is copied as
-    // byte-swapped 32-bit halves (swapped when the XOR is set) and its tags are filled together. False when the fast path does not apply.
+    // byte-swapped 32-bit halves (swapped when the XOR is set). False when the fast path does not apply.
     static bool loadBlockFast(uint8_t *TMEM, const uint8_t *RDRAM, uint32_t textureStart, uint32_t tmemStart, uint32_t tmemStride,
-        uint32_t wordCount, uint32_t dxt, uint32_t *wordTags, uint32_t tag)
+        uint32_t wordCount, uint32_t dxt)
     {
         constexpr uint32_t DXTSwap = 0x800;
         constexpr uint32_t TmemMask = RDP_TMEM_MASK8;
@@ -368,11 +364,6 @@ namespace RT64 {
                     memcpy(dst + i * 8 + 4, &a, 4);
                 }
             }
-            uint32_t *runTags = wordTags + (tmemAddress >> 3);
-            for (uint32_t i = 0; i < run; i++) {
-                runTags[i] = tag;
-            }
-
             textureAddress += run * 8;
             tmemAddress = (tmemAddress + run * 8) & TmemMask;
             dxtCounter += run * dxt;
@@ -386,128 +377,141 @@ namespace RT64 {
         return true;
     }
 
-    struct TmemCopy {
-        uint8_t bytes[RDP_TMEM_BYTES];
-        uint32_t tags[RDP_TMEM_WORDS];
-    };
-
     // Runs `load` on TMEM; under ROGUESQ_VG_TMEM_VERIFY also runs `reference` on a copy taken before and logs any difference.
     template<typename Load, typename Reference>
-    static void checkedLoad(const char *kind, uint8_t *TMEM, uint32_t *tags, Load load, Reference reference) {
+    static void checkedLoad(const char *kind, uint8_t *TMEM, Load load, Reference reference) {
         if (!s_verifyTmem) {
-            load(TMEM, tags);
+            load(TMEM);
             return;
         }
 
-        static TmemCopy ref;
+        static uint8_t ref[RDP_TMEM_BYTES];
         static uint32_t loads = 0, mismatches = 0;
-        memcpy(ref.bytes, TMEM, sizeof(ref.bytes));
-        memcpy(ref.tags, tags, sizeof(ref.tags));
-        load(TMEM, tags);
-        reference(ref.bytes, ref.tags);
+        memcpy(ref, TMEM, sizeof(ref));
+        load(TMEM);
+        reference(ref);
         loads++;
-        const bool bytesSame = memcmp(ref.bytes, TMEM, sizeof(ref.bytes)) == 0;
-        const bool tagsSame = memcmp(ref.tags, tags, sizeof(ref.tags)) == 0;
-        if ((!bytesSame || !tagsSame) && (++mismatches <= 10)) {
-            fprintf(stderr, "[tmem-verify] %s load #%u differs (bytes %d, tags %d)\n", kind, loads, bytesSame ? 0 : 1, tagsSame ? 0 : 1);
+        if ((memcmp(ref, TMEM, sizeof(ref)) != 0) && (++mismatches <= 10)) {
+            fprintf(stderr, "[tmem-verify] %s load #%u differs\n", kind, loads);
         }
         if ((loads % 20000) == 0) {
             fprintf(stderr, "[tmem-verify] %u loads checked, %u differ\n", loads, mismatches);
         }
     }
 
-    void RDP::loadTileOperation(const LoadTile &loadTile, const LoadTexture &loadTexture, bool) {
-        vg::ProfScope prof(vg::PROF_TMEM_LOAD);
-        const uint32_t bytesOffset = (loadTile.uls >> 2) << loadTexture.siz >> 1;
-        const uint32_t bytesPerRow = loadTexture.width << loadTexture.siz >> 1;
-        const uint32_t textureStart = loadTexture.address + bytesOffset + bytesPerRow * (loadTile.ult >> 2);
-        const uint32_t rowCount = 1 + ((loadTile.lrt >> 2) - (loadTile.ult >> 2));
-        const uint32_t tileWidth = ((loadTile.lrs >> 2) - (loadTile.uls >> 2));
-        const uint32_t wordsPerRow = (tileWidth >> (4 - loadTile.siz)) + 1;
-        const uint32_t tmemStart = loadTile.tmem << 3;
-        const uint32_t tmemStride = loadTile.line << 3;
-        const bool RGBA32 = (loadTile.siz == G_IM_SIZ_32b) && (loadTile.fmt == G_IM_FMT_RGBA);
-        const uint32_t tag = ++tmemLoadTag;
-        const uint8_t *RDRAM = state->RDRAM;
-        checkedLoad("tile", reinterpret_cast<uint8_t *>(TMEM), tmemWordTags,
-            [&](uint8_t *T, uint32_t *tags) {
+    static void tmemLoadTile(uint8_t *TMEM, const uint8_t *RDRAM, const vg::TmemLoad &l) {
+        const uint32_t bytesOffset = (l.uls >> 2) << l.textureSiz >> 1;
+        const uint32_t bytesPerRow = l.textureWidth << l.textureSiz >> 1;
+        const uint32_t textureStart = l.textureAddress + bytesOffset + bytesPerRow * (l.ult >> 2);
+        const uint32_t rowCount = 1 + ((l.lrt >> 2) - (l.ult >> 2));
+        const uint32_t tileWidth = ((l.lrs >> 2) - (l.uls >> 2));
+        const uint32_t wordsPerRow = (tileWidth >> (4 - l.tileSiz)) + 1;
+        const uint32_t tmemStart = l.tmem << 3;
+        const uint32_t tmemStride = l.line << 3;
+        const bool RGBA32 = (l.tileSiz == G_IM_SIZ_32b) && (l.tileFmt == G_IM_FMT_RGBA);
+        checkedLoad("tile", TMEM,
+            [&](uint8_t *T) {
                 if (RGBA32) {
-                    loadToTMEMCommon<true>(T, RDRAM, textureStart, bytesPerRow, tmemStart, tmemStride, wordsPerRow, rowCount, 0, tags, tag);
+                    loadToTMEMCommon<true>(T, RDRAM, textureStart, bytesPerRow, tmemStart, tmemStride, wordsPerRow, rowCount, 0);
                 }
                 else {
-                    loadToTMEMCommon<false>(T, RDRAM, textureStart, bytesPerRow, tmemStart, tmemStride, wordsPerRow, rowCount, 0, tags, tag);
+                    loadToTMEMCommon<false>(T, RDRAM, textureStart, bytesPerRow, tmemStart, tmemStride, wordsPerRow, rowCount, 0);
                 }
             },
-            [&](uint8_t *T, uint32_t *tags) {
+            [&](uint8_t *T) {
                 if (RGBA32) {
-                    loadToTMEMCommon<true, false, false, true>(T, RDRAM, textureStart, bytesPerRow, tmemStart, tmemStride, wordsPerRow, rowCount, 0, tags, tag);
+                    loadToTMEMCommon<true, false, false, true>(T, RDRAM, textureStart, bytesPerRow, tmemStart, tmemStride, wordsPerRow, rowCount, 0);
                 }
                 else {
-                    loadToTMEMCommon<false, false, false, true>(T, RDRAM, textureStart, bytesPerRow, tmemStart, tmemStride, wordsPerRow, rowCount, 0, tags, tag);
+                    loadToTMEMCommon<false, false, false, true>(T, RDRAM, textureStart, bytesPerRow, tmemStart, tmemStride, wordsPerRow, rowCount, 0);
                 }
             });
+    }
+
+    static void tmemLoadBlock(uint8_t *TMEM, const uint8_t *RDRAM, const vg::TmemLoad &l) {
+        const uint32_t bytesOffset = l.uls << l.textureSiz >> 1;
+        const uint32_t bytesPerRow = l.textureWidth << l.textureSiz >> 1;
+        const uint32_t textureStart = l.textureAddress + bytesOffset + bytesPerRow * l.ult;
+        const uint32_t wordCount = ((l.lrs - l.uls) >> (4 - l.tileSiz)) + 1;
+        const uint32_t tmemStart = l.tmem << 3;
+        const uint32_t tmemStride = l.line << 3;
+        const uint32_t dxt = l.lrt;
+        const bool RGBA32 = (l.tileSiz == G_IM_SIZ_32b) && (l.tileFmt == G_IM_FMT_RGBA);
+        checkedLoad("block", TMEM,
+            [&](uint8_t *T) {
+                if (RGBA32) {
+                    loadToTMEMCommon<true, true>(T, RDRAM, textureStart, bytesPerRow, tmemStart, tmemStride, wordCount, 1, dxt);
+                }
+                else if (!s_fastTmem || !loadBlockFast(T, RDRAM, textureStart, tmemStart, tmemStride, wordCount, dxt)) {
+                    loadToTMEMCommon<false, true>(T, RDRAM, textureStart, bytesPerRow, tmemStart, tmemStride, wordCount, 1, dxt);
+                }
+            },
+            [&](uint8_t *T) {
+                if (RGBA32) {
+                    loadToTMEMCommon<true, true, false, true>(T, RDRAM, textureStart, bytesPerRow, tmemStart, tmemStride, wordCount, 1, dxt);
+                }
+                else {
+                    loadToTMEMCommon<false, true, false, true>(T, RDRAM, textureStart, bytesPerRow, tmemStart, tmemStride, wordCount, 1, dxt);
+                }
+            });
+    }
+
+    static void tmemLoadTLUT(uint8_t *TMEM, const uint8_t *RDRAM, const vg::TmemLoad &l) {
+        const uint32_t bytesOffset = (l.uls >> 2) << l.textureSiz >> 1;
+        const uint32_t bytesPerRow = l.textureWidth << l.textureSiz >> 1;
+        const uint32_t textureStart = l.textureAddress + bytesOffset + bytesPerRow * (l.ult >> 2);
+        const uint32_t rowCount = 1 + ((l.lrt >> 2) - (l.ult >> 2));
+        const uint32_t wordsPerRow = ((l.lrs >> 2) - (l.uls >> 2)) + 1;
+        const uint32_t tmemStart = l.tmem << 3;
+        const uint32_t tmemStride = l.line << 5;
+        const bool RGBA32 = (l.tileSiz == G_IM_SIZ_32b) && (l.tileFmt == G_IM_FMT_RGBA);
+        checkedLoad("tlut", TMEM,
+            [&](uint8_t *T) {
+                if (RGBA32) {
+                    loadToTMEMCommon<true, false, true>(T, RDRAM, textureStart, bytesPerRow, tmemStart, tmemStride, wordsPerRow, rowCount, 0);
+                }
+                else {
+                    loadToTMEMCommon<false, false, true>(T, RDRAM, textureStart, bytesPerRow, tmemStart, tmemStride, wordsPerRow, rowCount, 0);
+                }
+            },
+            [&](uint8_t *T) {
+                if (RGBA32) {
+                    loadToTMEMCommon<true, false, true, true>(T, RDRAM, textureStart, bytesPerRow, tmemStart, tmemStride, wordsPerRow, rowCount, 0);
+                }
+                else {
+                    loadToTMEMCommon<false, false, true, true>(T, RDRAM, textureStart, bytesPerRow, tmemStart, tmemStride, wordsPerRow, rowCount, 0);
+                }
+            });
+    }
+
+    static vg::TmemLoad makeTmemLoad(vg::TmemLoad::Kind kind, const LoadTile &t, const LoadTexture &texture) {
+        vg::TmemLoad l;
+        l.kind = kind;
+        l.tileFmt = t.fmt;
+        l.tileSiz = t.siz;
+        l.textureSiz = texture.siz;
+        l.line = t.line;
+        l.tmem = t.tmem;
+        l.uls = t.uls;
+        l.ult = t.ult;
+        l.lrs = t.lrs;
+        l.lrt = t.lrt;
+        l.textureWidth = texture.width;
+        l.textureAddress = texture.address;
+        return l;
+    }
+
+    // Only the F5 diagnostics call these directly; drawing uses the submitter's TMEM.
+    void RDP::loadTileOperation(const LoadTile &loadTile, const LoadTexture &loadTexture, bool) {
+        vg::applyTmemLoad(reinterpret_cast<uint8_t *>(TMEM), state->RDRAM, makeTmemLoad(vg::TmemLoad::Kind::Tile, loadTile, loadTexture));
     }
 
     void RDP::loadBlockOperation(const LoadTile &loadTile, const LoadTexture &loadTexture, bool) {
-        vg::ProfScope prof(vg::PROF_TMEM_LOAD);
-        const uint32_t bytesOffset = loadTile.uls << loadTexture.siz >> 1;
-        const uint32_t bytesPerRow = loadTexture.width << loadTexture.siz >> 1;
-        const uint32_t textureStart = loadTexture.address + bytesOffset + bytesPerRow * loadTile.ult;
-        const uint32_t wordCount = ((loadTile.lrs - loadTile.uls) >> (4 - loadTile.siz)) + 1;
-        const uint32_t tmemStart = loadTile.tmem << 3;
-        const uint32_t tmemStride = loadTile.line << 3;
-        const uint32_t dxt = loadTile.lrt;
-        const bool RGBA32 = (loadTile.siz == G_IM_SIZ_32b) && (loadTile.fmt == G_IM_FMT_RGBA);
-        const uint32_t tag = ++tmemLoadTag;
-        const uint8_t *RDRAM = state->RDRAM;
-        checkedLoad("block", reinterpret_cast<uint8_t *>(TMEM), tmemWordTags,
-            [&](uint8_t *T, uint32_t *tags) {
-                if (RGBA32) {
-                    loadToTMEMCommon<true, true>(T, RDRAM, textureStart, bytesPerRow, tmemStart, tmemStride, wordCount, 1, dxt, tags, tag);
-                }
-                else if (!s_fastTmem || !loadBlockFast(T, RDRAM, textureStart, tmemStart, tmemStride, wordCount, dxt, tags, tag)) {
-                    loadToTMEMCommon<false, true>(T, RDRAM, textureStart, bytesPerRow, tmemStart, tmemStride, wordCount, 1, dxt, tags, tag);
-                }
-            },
-            [&](uint8_t *T, uint32_t *tags) {
-                if (RGBA32) {
-                    loadToTMEMCommon<true, true, false, true>(T, RDRAM, textureStart, bytesPerRow, tmemStart, tmemStride, wordCount, 1, dxt, tags, tag);
-                }
-                else {
-                    loadToTMEMCommon<false, true, false, true>(T, RDRAM, textureStart, bytesPerRow, tmemStart, tmemStride, wordCount, 1, dxt, tags, tag);
-                }
-            });
+        vg::applyTmemLoad(reinterpret_cast<uint8_t *>(TMEM), state->RDRAM, makeTmemLoad(vg::TmemLoad::Kind::Block, loadTile, loadTexture));
     }
 
     void RDP::loadTLUTOperation(const LoadTile &loadTile, const LoadTexture &loadTexture, bool) {
-        vg::ProfScope prof(vg::PROF_TMEM_LOAD);
-        const uint32_t bytesOffset = (loadTile.uls >> 2) << loadTexture.siz >> 1;
-        const uint32_t bytesPerRow = loadTexture.width << loadTexture.siz >> 1;
-        const uint32_t textureStart = loadTexture.address + bytesOffset + bytesPerRow * (loadTile.ult >> 2);
-        const uint32_t rowCount = 1 + ((loadTile.lrt >> 2) - (loadTile.ult >> 2));
-        const uint32_t wordsPerRow = ((loadTile.lrs >> 2) - (loadTile.uls >> 2)) + 1;
-        const uint32_t tmemStart = loadTile.tmem << 3;
-        const uint32_t tmemStride = loadTile.line << 5;
-        const bool RGBA32 = (loadTile.siz == G_IM_SIZ_32b) && (loadTile.fmt == G_IM_FMT_RGBA);
-        const uint32_t tag = ++tmemLoadTag;
-        const uint8_t *RDRAM = state->RDRAM;
-        checkedLoad("tlut", reinterpret_cast<uint8_t *>(TMEM), tmemWordTags,
-            [&](uint8_t *T, uint32_t *tags) {
-                if (RGBA32) {
-                    loadToTMEMCommon<true, false, true>(T, RDRAM, textureStart, bytesPerRow, tmemStart, tmemStride, wordsPerRow, rowCount, 0, tags, tag);
-                }
-                else {
-                    loadToTMEMCommon<false, false, true>(T, RDRAM, textureStart, bytesPerRow, tmemStart, tmemStride, wordsPerRow, rowCount, 0, tags, tag);
-                }
-            },
-            [&](uint8_t *T, uint32_t *tags) {
-                if (RGBA32) {
-                    loadToTMEMCommon<true, false, true, true>(T, RDRAM, textureStart, bytesPerRow, tmemStart, tmemStride, wordsPerRow, rowCount, 0, tags, tag);
-                }
-                else {
-                    loadToTMEMCommon<false, false, true, true>(T, RDRAM, textureStart, bytesPerRow, tmemStart, tmemStride, wordsPerRow, rowCount, 0, tags, tag);
-                }
-            });
+        vg::applyTmemLoad(reinterpret_cast<uint8_t *>(TMEM), state->RDRAM, makeTmemLoad(vg::TmemLoad::Kind::TLUT, loadTile, loadTexture));
     }
 
     void RDP::loadTile(uint8_t tile, uint16_t uls, uint16_t ult, uint16_t lrs, uint16_t lrt) {
@@ -520,7 +524,7 @@ namespace RT64 {
             return;
         }
         state->renderer->flush();
-        loadTileOperation(t, texture, false);
+        state->renderer->queueLoad(makeTmemLoad(vg::TmemLoad::Kind::Tile, t, texture));
         state->updateDrawStatusAttribute(DrawAttribute::Texture);
     }
 
@@ -542,7 +546,7 @@ namespace RT64 {
             return;
         }
         state->renderer->flush();
-        loadBlockOperation(t, texture, false);
+        state->renderer->queueLoad(makeTmemLoad(vg::TmemLoad::Kind::Block, t, texture));
         state->updateDrawStatusAttribute(DrawAttribute::Texture);
     }
 
@@ -553,7 +557,7 @@ namespace RT64 {
         t.lrs = lrs;
         t.lrt = lrt;
         state->renderer->flush();
-        loadTLUTOperation(t, texture, false);
+        state->renderer->queueLoad(makeTmemLoad(vg::TmemLoad::Kind::TLUT, t, texture));
         state->updateDrawStatusAttribute(DrawAttribute::Texture);
     }
 
@@ -878,3 +882,20 @@ namespace RT64 {
 
     void RDP::updateCallTexcoords(float, float) { }
 };
+
+namespace vg {
+    void applyTmemLoad(uint8_t *TMEM, const uint8_t *RDRAM, const TmemLoad &load) {
+        ProfScope prof(PROF_TMEM_LOAD);
+        switch (load.kind) {
+            case TmemLoad::Kind::Tile:
+                RT64::tmemLoadTile(TMEM, RDRAM, load);
+                break;
+            case TmemLoad::Kind::Block:
+                RT64::tmemLoadBlock(TMEM, RDRAM, load);
+                break;
+            case TmemLoad::Kind::TLUT:
+                RT64::tmemLoadTLUT(TMEM, RDRAM, load);
+                break;
+        }
+    }
+}
