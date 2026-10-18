@@ -706,7 +706,7 @@ namespace RT64 {
         }
 
         // op_02's per-vertex RGBA buffer (declared in the internal header).
-        thread_local uint32_t s_last_op02_colorbuf = 0, s_last_op02_colorcnt = 0;
+        F5_THREAD_LOCAL uint32_t s_last_op02_colorbuf = 0, s_last_op02_colorcnt = 0;
 
         // Shared with rt64_gbi_f5_rdpstate.cpp (declared in the internal header).
         int s_ci4_tlut_recent = 0;
@@ -716,9 +716,16 @@ namespace RT64 {
         int s_attrib_fills_frame = 0;
         int s_attrib_frame_idx = 0;
         int s_attrib_prev_glyphs = 0;
-        thread_local int s_cart_pass = 0;
+        F5_THREAD_LOCAL int s_cart_pass = 0;
 
         // ------------------------------------------------------------ helpers
+        // The chunk-bound checks run before every bounded command; their rare paths stay out of line so the common one needs no stack frame.
+#if defined(_MSC_VER) && !defined(__clang__)
+#define F5_NOINLINE __declspec(noinline)
+#else
+#define F5_NOINLINE __attribute__((noinline))
+#endif
+
         static inline uint32_t f5_dl_off(State* state, const DisplayList* dl) {
             return (uint32_t)(reinterpret_cast<const uint8_t*>(dl) - state->fromRDRAM(0));
         }
@@ -811,7 +818,7 @@ namespace RT64 {
             if (n < (uint32_t)F5_CHAIN_MAX) { s_chain[depth][n++] = chunk; if (n > s_task_maxchain) s_task_maxchain = n; }
             return false;
         }
-        static void f5_next_chunk(State* state, DisplayList** dl) {
+        F5_NOINLINE static void f5_next_chunk(State* state, DisplayList** dl) {
             const uint32_t d = f5_depth(state);
             const uint32_t base = (d < (uint32_t)F5_MAX_DEPTH) ? s_chunk_base[d] : 0;
             const uint32_t next = base ? f5_rd32(state, base) : 0;
@@ -857,71 +864,94 @@ namespace RT64 {
             if (d < (uint32_t)F5_MAX_DEPTH) s_chunk_base[d] = f5_dl_off(state, *dl);
         }
 
-        static bool f5_ran_off_chunk(State* state, const DisplayList* dl) {
+        // New task: the root chunk starts at its first bounded command.
+        F5_NOINLINE static void f5_begin_task_walk(State* state, uint32_t off) {
+            s_chunk_counter = state->displayListCounter;
+            g_f5_task_hops = s_chunk_hops; g_f5_task_faces = s_task_faces;
+            // ROGUESQ_LOG_GFX_TASK: one line per finished F5 task (faces/entries/hops + whether a
+            // budget cap ended it) to correlate object flicker with dropped geometry.
+            { static bool s_tl = env_on("ROGUESQ_LOG_GFX_TASK", false);
+              if (s_tl) { std::fprintf(stderr, "[f5-task] done before #%llu: faces=%u entries=%u hops=%u budget_trip=%u tiles=%u maxchain=%u\n",
+                  (unsigned long long)s_chunk_counter, s_task_faces, s_task_entries, s_chunk_hops, s_task_budget_trip, s_task_tiles, s_task_maxchain); std::fflush(stderr); } }
+            s_task_budget_trip = 0; s_task_tiles = 0; s_task_maxchain = 0;
+            s_chunk_hops = 0; s_task_faces = 0; s_task_entries = 0; s_hop_n = 0;
+            std::memset(s_chunk_base, 0, sizeof(s_chunk_base));
+            std::memset(s_chain_len, 0, sizeof(s_chain_len));
+            s_chunk_base[0] = off;
+        }
+
+        static inline bool f5_ran_off_chunk(State* state, const DisplayList* dl) {
             static bool s_on = env_on("ROGUESQ_F5_CHUNK_BOUND", true);
             if (!s_on) return false;
             const uint32_t off = f5_dl_off(state, dl);
-            if (state->displayListCounter != s_chunk_counter) {   // new task: root chunk starts here
-                s_chunk_counter = state->displayListCounter;
-                g_f5_task_hops = s_chunk_hops; g_f5_task_faces = s_task_faces;
-                // ROGUESQ_LOG_GFX_TASK: one line per finished F5 task (faces/entries/hops + whether a
-                // budget cap ended it) to correlate object flicker with dropped geometry.
-                { static bool s_tl = env_on("ROGUESQ_LOG_GFX_TASK", false);
-                  if (s_tl) { std::fprintf(stderr, "[f5-task] done before #%llu: faces=%u entries=%u hops=%u budget_trip=%u tiles=%u maxchain=%u\n",
-                      (unsigned long long)s_chunk_counter, s_task_faces, s_task_entries, s_chunk_hops, s_task_budget_trip, s_task_tiles, s_task_maxchain); std::fflush(stderr); } }
-                s_task_budget_trip = 0; s_task_tiles = 0; s_task_maxchain = 0;
-                s_chunk_hops = 0; s_task_faces = 0; s_task_entries = 0; s_hop_n = 0;
-                std::memset(s_chunk_base, 0, sizeof(s_chunk_base));
-                std::memset(s_chain_len, 0, sizeof(s_chain_len));
-                s_chunk_base[0] = off;
+            if (state->displayListCounter != s_chunk_counter) {
+                f5_begin_task_walk(state, off);
                 return false;
             }
             const uint32_t d = f5_depth(state);
             return d < (uint32_t)F5_MAX_DEPTH && s_chunk_base[d] != 0 && off >= s_chunk_base[d] + 0x108u;
         }
+        // Per-task budgets: a stale call into recycled chunks otherwise storms the parser with thousands of
+        // garbage faces (hw goldens: < 400 chunk entries, < 700 faces per task). Ending the task drops the
+        // rest of one frame instead of stalling for half a second.
+        struct F5Caps { uint32_t entries, faces; };
+        F5_NOINLINE static F5Caps f5_read_caps() {
+            const char* e = std::getenv("ROGUESQ_F5_ENTRY_CAP");
+            const char* f = std::getenv("ROGUESQ_F5_FACE_CAP");
+            return { (e && *e) ? (uint32_t)std::atoi(e) : 2048u, (f && *f) ? (uint32_t)std::atoi(f) : 4096u };
+        }
+        static inline const F5Caps& f5_caps() {
+            static const F5Caps s_caps = f5_read_caps();
+            return s_caps;
+        }
+
+        F5_NOINLINE static void f5_budget_trip(State* state, DisplayList** dl) {
+            s_task_budget_trip = 1;
+            static int s_n = 0;
+            if (gbi_log_enabled() && ++s_n <= 8) { std::fprintf(stderr, "[gbi-f5] task budget exceeded (entries %u faces %u); ending task\n", s_task_entries, s_task_faces); std::fflush(stderr); }
+            // ROGUESQ_DUMP_ON_BUDGET=<path>: RDRAM snapshot at the first budget trip (walk it offline with
+            // tools/validate/f5_dl_walk.py from the task's data_ptr to see where the list enters freed chunks).
+            static const char* s_dump = std::getenv("ROGUESQ_DUMP_ON_BUDGET");
+            static bool s_dumped = false;
+            if (s_dump && *s_dump && !s_dumped) {
+                s_dumped = true;
+                const uint32_t n = s_hop_n < 4096 ? s_hop_n : 4096;
+                std::fprintf(stderr, "[gbi-f5] budget trip: last %u chunk transitions (from -> to depth: first payload words)\n", n);
+                for (uint32_t i = 0; i < n; ++i) { const F5Hop& h = s_hops[(s_hop_n - n + i) & 4095]; std::fprintf(stderr, "  %06X -> %06X d%u: %08X %08X\n", h.from, h.to, h.depth, h.w0, h.w1); }
+                if (FILE* f = std::fopen(s_dump, "wb")) {
+                    std::vector<uint8_t> buf(0x800000);
+                    for (uint32_t i = 0; i < buf.size(); ++i) buf[i] = state->RDRAM[i ^ 3];
+                    std::fwrite(buf.data(), 1, buf.size(), f); std::fclose(f);
+                    std::fprintf(stderr, "[gbi-f5] budget dump written: %s\n", s_dump); std::fflush(stderr);
+                }
+            }
+            while (!state->returnAddressStack.empty()) state->popReturnAddress();
+            *dl = nullptr;
+        }
+
+        F5_NOINLINE static void f5_unknown_op(uint32_t op, DisplayList** dl) {
+            static int s_n[UCODE_MAP_SIZE] = {};
+            if (gbi_log_enabled() && ++s_n[op] <= 4) {
+                std::fprintf(stderr, "[gbi-f5] unknown op 0x%02X w0=0x%08X w1=0x%08X\n", op, (*dl)->w0, (*dl)->w1);
+                std::fflush(stderr);
+            }
+        }
+
         template <int OP>
         static void f5_bounded(State* state, DisplayList** dl) {
             if (f5_ran_off_chunk(state, *dl)) {
                 f5_next_chunk(state, dl);
                 return;
             }
-            // Per-task budgets: a stale call into recycled chunks otherwise storms the parser with thousands of
-            // garbage faces (hw goldens: < 400 chunk entries, < 700 faces per task). Ending the task drops the
-            // rest of one frame instead of stalling for half a second.
-            static const uint32_t s_entry_cap = [](){ const char* e = std::getenv("ROGUESQ_F5_ENTRY_CAP"); return (e && *e) ? (uint32_t)std::atoi(e) : 2048u; }();
-            static const uint32_t s_face_cap = [](){ const char* e = std::getenv("ROGUESQ_F5_FACE_CAP"); return (e && *e) ? (uint32_t)std::atoi(e) : 4096u; }();
-            if (s_task_entries > s_entry_cap || s_task_faces > s_face_cap) {
-                s_task_budget_trip = 1;
-                static int s_n = 0;
-                if (gbi_log_enabled() && ++s_n <= 8) { std::fprintf(stderr, "[gbi-f5] task budget exceeded (entries %u faces %u); ending task\n", s_task_entries, s_task_faces); std::fflush(stderr); }
-                // ROGUESQ_DUMP_ON_BUDGET=<path>: RDRAM snapshot at the first budget trip (walk it offline with
-                // tools/validate/f5_dl_walk.py from the task's data_ptr to see where the list enters freed chunks).
-                static const char* s_dump = std::getenv("ROGUESQ_DUMP_ON_BUDGET");
-                static bool s_dumped = false;
-                if (s_dump && *s_dump && !s_dumped) {
-                    s_dumped = true;
-                    const uint32_t n = s_hop_n < 4096 ? s_hop_n : 4096;
-                    std::fprintf(stderr, "[gbi-f5] budget trip: last %u chunk transitions (from -> to depth: first payload words)\n", n);
-                    for (uint32_t i = 0; i < n; ++i) { const F5Hop& h = s_hops[(s_hop_n - n + i) & 4095]; std::fprintf(stderr, "  %06X -> %06X d%u: %08X %08X\n", h.from, h.to, h.depth, h.w0, h.w1); }
-                    if (FILE* f = std::fopen(s_dump, "wb")) {
-                        std::vector<uint8_t> buf(0x800000);   // heap: a static here would be instantiated per opcode
-                        for (uint32_t i = 0; i < buf.size(); ++i) buf[i] = state->RDRAM[i ^ 3];
-                        std::fwrite(buf.data(), 1, buf.size(), f); std::fclose(f);
-                        std::fprintf(stderr, "[gbi-f5] budget dump written: %s\n", s_dump); std::fflush(stderr);
-                    }
-                }
-                while (!state->returnAddressStack.empty()) state->popReturnAddress();
-                *dl = nullptr;
+            const F5Caps& caps = f5_caps();
+            if (s_task_entries > caps.entries || s_task_faces > caps.faces) {
+                f5_budget_trip(state, dl);
                 return;
             }
             if (s_inner[OP]) {
                 s_inner[OP](state, dl);
             } else {
-                static int s_n = 0;
-                if (gbi_log_enabled() && ++s_n <= 4) {
-                    std::fprintf(stderr, "[gbi-f5] unknown op 0x%02X w0=0x%08X w1=0x%08X\n", OP, (*dl)->w0, (*dl)->w1);
-                    std::fflush(stderr);
-                }
+                f5_unknown_op(OP, dl);
             }
         }
         template <int... I>
@@ -1314,7 +1344,7 @@ namespace RT64 {
         // 0x82 = texcoord scale at DMEM 0x140: 4 hi halfwords (s,t,s,t) then 4 lo halfwords, 16.16.
         // The tri path multiplies each raw per-face UV by it (vmudn lo / vmadh hi) to get S10.5;
         // the game sends (W-1)/128 per material, so raw UVs are 4.12 normalized, not 8.8 texels.
-        static thread_local int32_t s_tc_scale[2] = { 0, 0 };
+        static F5_THREAD_LOCAL int32_t s_tc_scale[2] = { 0, 0 };
         // Fog = two signed 16.16 words: M at DMEM 0x160 (moveword 8 or 03 88) and O at DMEM 0x164
         // (moveword 0x0A or 03 88). The ucode stores alpha = 255 * clamp(depth*M + O, 0, 1). RT64 takes
         // alpha = depth*mul + offset, so mul = 255*M, offset = 255*O, written as floats: the values
@@ -1351,8 +1381,8 @@ namespace RT64 {
         // ------------------------------------------------ geometry state
         // Scratch RDRAM (zero on hardware in every golden): converted vertices + a viewport.
 
-        static thread_local uint32_t s_cache_count = 0;
-        static thread_local uint32_t s_vp_key = 0;
+        static F5_THREAD_LOCAL uint32_t s_cache_count = 0;
+        static F5_THREAD_LOCAL uint32_t s_vp_key = 0;
 
         // Factor 5's stream never sends G_MW_CLIP; stock ucode sets clip ratio 2 (guard band) in reset().
         // Without it the F5 path keeps the RSP default (1 = no guard band), so large/close geometry and
@@ -1978,6 +2008,10 @@ namespace RT64 {
                         }
                     }
                 }
+#ifdef RT64_VITA_SHIM
+                // Vita: the vertices' load-time transform is reused while the matrix and viewport are unchanged (vg_rsp.cpp).
+                state->rsp->faceSourceSlots = idx;
+#endif
                 state->rsp->setVertex(0x80000000u | (F5_VTX_SCRATCH + F5_FACE_SLOT * sizeof(RSP::Vertex)), n, F5_FACE_SLOT);
                 // Full-screen overlay quads (the pause dim) are world quads sized to the 4:3 frustum; widescreen would leave the sides uncovered, so grow them in their own plane.
                 static const bool s_widen_overlay = env_on("ROGUESQ_F5_OVERLAY_WIDEN", true);

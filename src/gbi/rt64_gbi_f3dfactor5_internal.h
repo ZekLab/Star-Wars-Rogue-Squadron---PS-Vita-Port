@@ -14,6 +14,13 @@
 #include "rt64_gbi.h"        // DisplayList
 #include "hle/rt64_state.h"  // State (+ rdp)
 
+// The Vita build parses on one thread, and its toolchain emulates thread_local (a libgcc call and a TLS key search per access).
+#ifdef RT64_VITA_SHIM
+#define F5_THREAD_LOCAL
+#else
+#define F5_THREAD_LOCAL thread_local
+#endif
+
 // --- Shared game/host globals (extern "C") --------------------------------------------
 // Declared ONCE here so every F5 GBI module (core/model/rdpstate/...) shares one
 // declaration instead of re-declaring them. Defined in upstream_compat.cpp / the
@@ -152,7 +159,7 @@ namespace RT64 {
         extern int s_attrib_fills_frame;
         extern int s_attrib_frame_idx;
         extern int s_attrib_prev_glyphs;
-        extern thread_local int s_cart_pass;  // cartridge render-pass counter (def in core)
+        extern F5_THREAD_LOCAL int s_cart_pass;  // cartridge render-pass counter (def in core)
 
         // --- Shared core gates/helpers (defined in rt64_gbi_f3dfactor5.cpp), used
         //     across modules: the ROGUESQ_LOG_GBI gate + the unified-pipeline MVP composer.
@@ -162,7 +169,7 @@ namespace RT64 {
         // fewer than 2 distinct matrices are available yet.
         bool f5_compose_mvp(const uint8_t* ram, float Mout[12]);
         // op_02's per-vertex RGBA color buffer (set by op_02, read by render_op04_unified).
-        extern thread_local uint32_t s_last_op02_colorbuf, s_last_op02_colorcnt;
+        extern F5_THREAD_LOCAL uint32_t s_last_op02_colorbuf, s_last_op02_colorcnt;
 
     } // namespace GBI_F3DFACTOR5
 } // namespace RT64

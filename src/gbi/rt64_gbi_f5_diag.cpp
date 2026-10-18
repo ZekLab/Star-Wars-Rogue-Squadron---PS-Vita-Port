@@ -17,10 +17,10 @@ namespace RT64 {
 
         // Probe-local MVP state (classified by m[3][3]: proj≈0, modelview≈1),
         // separate from the live render path. Only used to log would-be coords.
-        static thread_local hlslpp::float4x4 s_probe_proj;
-        static thread_local hlslpp::float4x4 s_probe_mv;
-        static thread_local hlslpp::float4x4 s_probe_mvp;
-        static thread_local bool s_probe_have_proj = false, s_probe_have_mv = false, s_probe_mvp_valid = false;
+        static F5_THREAD_LOCAL hlslpp::float4x4 s_probe_proj;
+        static F5_THREAD_LOCAL hlslpp::float4x4 s_probe_mv;
+        static F5_THREAD_LOCAL hlslpp::float4x4 s_probe_mvp;
+        static F5_THREAD_LOCAL bool s_probe_have_proj = false, s_probe_have_mv = false, s_probe_mvp_valid = false;
 
         void f5_probe_op01(uint32_t w0, uint32_t w1, const uint8_t* ram) {
             if ((w1 & 0xFF000000u) != 0x80000000u) return;
