@@ -1268,6 +1268,22 @@ namespace RT64 {
                     v.color.r = out[0]; v.color.g = out[1]; v.color.b = out[2]; v.color.a = out[3];
                 }
             };
+#ifdef RT64_VITA_SHIM
+            // Vita: the whole lattice in one setVertex when it fits the face slots, so rows shared by two strips are transformed once; same triangles in the same order.
+            if ((N + 1) * (N + 1) <= (int)(RSP_MAX_VERTICES - F5_FACE_SLOT)) {
+                RSP::Vertex* tmp = reinterpret_cast<RSP::Vertex*>(state->fromRDRAM(F5_VTX_SCRATCH + F5_FACE_SLOT * sizeof(RSP::Vertex)));
+                for (int r = 0; r <= N; ++r) for (int c = 0; c <= N; ++c) emit_vertex(tmp[r * (N + 1) + c], (float)c / s_sub, (float)r / s_sub);
+                state->rsp->setVertex(0x80000000u | (F5_VTX_SCRATCH + F5_FACE_SLOT * sizeof(RSP::Vertex)), (N + 1) * (N + 1), F5_FACE_SLOT);
+                for (int rr = 0; rr < N; ++rr) for (int cc = 0; cc < N; ++cc) {
+                    const int v0 = F5_FACE_SLOT + rr * (N + 1) + cc, v2 = v0 + (N + 1);
+                    f5_count_auto(state, 1);
+                    state->rsp->drawIndexedTri(v0, v2 + 1, v2);
+                    state->rsp->drawIndexedTri(v0, v0 + 1, v2 + 1);
+                }
+                s_task_faces += 2;
+                return;
+            }
+#endif
             std::vector<RSP::Vertex> geom((size_t)N * 2 * (N + 1));
             for (int rr = 0; rr < N; ++rr) {   // one 2-row strip at a time
                 RSP::Vertex* strip = geom.data() + (size_t)rr * 2 * (N + 1);
