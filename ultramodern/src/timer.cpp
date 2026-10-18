@@ -157,7 +157,11 @@ std::chrono::high_resolution_clock::duration ultramodern::time_since_start() {
     return std::chrono::high_resolution_clock::now() - start_time;
 }
 
+// Calls of the two clocks the game reads (the host clock read costs ~5 us on the Vita), for the render context's report.
+extern "C" volatile uint32_t g_rs64_osgetcount_calls = 0, g_rs64_osgettime_calls = 0;
+
 extern "C" u32 osGetCount() {
+    g_rs64_osgetcount_calls = g_rs64_osgetcount_calls + 1;
     uint64_t total_count = time_now();
 
     // Allow for overflows, which is how osGetCount behaves
@@ -169,6 +173,7 @@ extern "C" void osSetCount(u32 count) {
 }
 
 extern "C" OSTime osGetTime() {
+    g_rs64_osgettime_calls = g_rs64_osgettime_calls + 1;
     uint64_t total_count = time_now() - ostime_offset;
 
     return total_count;
