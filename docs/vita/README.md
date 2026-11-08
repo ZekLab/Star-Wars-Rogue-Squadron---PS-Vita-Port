@@ -1,5 +1,10 @@
 # Star Wars: Rogue Squadron for PS Vita
 
+## ☕ Enjoying the port? Buy me a coffee
+
+If this port gives you some good hours on your Vita, you can support the work at
+[buymeacoffee.com/tavasiberiu](https://buymeacoffee.com/tavasiberiu).
+
 An unofficial native port of *Star Wars: Rogue Squadron* (N64, USA v1.0) to the PS Vita, built on
 [Rogue Squadron 64 Recompiled](https://github.com/MikeSemicolonD/RogueSquadron64Recomp).
 
@@ -140,10 +145,6 @@ Open an issue with:
 - What you were doing (mission, craft), and whether it happens again.
 - `ux0:data/RogueSquadronVita/log.txt` (and `log_prev.txt` if the game was started again since).
 - After a crash, the newest `psp2core-*.psp2dmp` file in `ux0:data/`.
-
-## Support
-
-If you enjoy the port, you can [buy me a coffee](https://buymeacoffee.com/tavasiberiu).
 
 ## Legal notice
 
