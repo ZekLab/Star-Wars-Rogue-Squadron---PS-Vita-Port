@@ -54,7 +54,7 @@ set(MUSYX_AUDIO_C   ${RS64_ROOT}/build/factor5_ucode/musyx_audio_recompiled.c)
 set(STATE_TABLE_INL ${RS64_ROOT}/src/main/state_table.inl)
 foreach(generated ${FACTOR5_BOOT_C} ${FACTOR5_UCODE_C} ${MUSYX_AUDIO_C} ${STATE_TABLE_INL})
     if (NOT EXISTS ${generated})
-        message(FATAL_ERROR "Missing generated file ${generated}; run the desktop configure/RSPRecomp steps first (docs/vita/progress.md)")
+        message(FATAL_ERROR "Missing generated file ${generated}; run the desktop configure/RSPRecomp steps first (docs/vita/README.md)")
     endif()
 endforeach()
 set_source_files_properties(${FACTOR5_BOOT_C} ${FACTOR5_UCODE_C} ${MUSYX_AUDIO_C} PROPERTIES

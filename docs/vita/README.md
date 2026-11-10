@@ -74,8 +74,6 @@ Other versions (Europe, Japan, v1.1) do not work. The dump must be in `.z64` byt
    The result is `vita/build/RogueSquadronVita.vpk`. Without the LiveArea images (`tools/vita/livearea_from_art.py`
    makes them from the box art, locally) the VPK uses the system defaults.
 
-[progress.md](progress.md) (in Romanian) has the details of the port and its history.
-
 ## Installation
 
 1. Install `RogueSquadronVita.vpk` with VitaShell.
